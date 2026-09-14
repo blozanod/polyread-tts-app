@@ -1,0 +1,39 @@
+name: Build and test
+
+# Compiles the PolyRead Swift package and runs its unit tests on a
+# GitHub-hosted macOS runner. This is the "does it compile / do the
+# existing tests pass" loop from the README's `swift test` note — it
+# runs on GitHub's infrastructure, so no local Mac is required.
+#
+# It does NOT build the App/ Xcode target (that needs the Core ML model
+# files described in Models/README.md, plus code signing) and it cannot
+# exercise anything that needs a real device (Neural Engine, the §0
+# benchmark). It only proves the Sources/ and Tests/ package builds and
+# its logic-level tests pass on an iOS Simulator.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode / Swift version
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: List available iOS simulators
+        run: xcrun simctl list devices available
+
+      - name: Build and test PolyRead package
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -scheme PolyRead \
+            -destination 'platform=iOS Simulator,name=iPhone 16'
