@@ -32,22 +32,42 @@ jobs:
           xcodebuild -list
           xcodebuild -showsdks
 
+      - name: Pick an available iOS 18.5 simulator UDID
+        id: device
+        run: |
+          set -o pipefail
+          # Matching by name/OS string ("name=iPhone 16,OS=18.5") kept failing
+          # even when both the name and the OS individually check out — the
+          # runner has multiple Xcode installs and simulator registries, and
+          # xcodebuild's string matching against them isn't reliable here.
+          # Ask simctl directly (the actual simulator registry) for a device
+          # it considers available under the iOS 18.5 runtime, and target it
+          # by UDID — unambiguous, no string matching involved.
+          udid=$(xcrun simctl list devices available --json | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+for runtime, devices in data["devices"].items():
+    if "iOS-18-5" not in runtime:
+        continue
+    for d in devices:
+        if d.get("isAvailable", True):
+            print(d["udid"])
+            sys.exit(0)
+')
+          if [ -z "$udid" ]; then
+            echo "::error::No available iOS 18.5 simulator found"
+            xcrun simctl list devices available
+            exit 1
+          fi
+          echo "Using simulator udid=$udid"
+          echo "udid=$udid" >> "$GITHUB_OUTPUT"
+
       - name: Build and test PolyRead package
         run: |
           set -o pipefail
           # .swiftpm/xcode/xcshareddata/xcschemes/PolyReadAllTests.xcscheme is
           # a checked-in scheme with a Test action covering all four test
           # targets — xcodebuild's auto-generated schemes don't have one.
-          #
-          # `xcodebuild -showdestinations` against that scheme (tried
-          # previously) fails outright: its buildables are XCTest bundles,
-          # which can never satisfy a Run/Launch action, so xcodebuild
-          # refuses to resolve anything for it regardless of the scheme's
-          # buildForRunning flag. So this pins a destination directly instead
-          # of trying to auto-discover one: iPhone 16 on iOS 18.5, which the
-          # runner's active Xcode 16.4 (confirmed via `xcodebuild -version`
-          # earlier in this job) ships paired with, and which the simulator
-          # list from an earlier run confirmed exists on this runner image.
           xcodebuild test \
             -scheme PolyReadAllTests \
-            -destination 'platform=iOS Simulator,name=iPhone 16,OS=18.5'
+            -destination "id=${{ steps.device.outputs.udid }}"
