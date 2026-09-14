@@ -208,12 +208,10 @@ public actor SynthesisCoordinator {
         } else if adjusted.count < expected {
             adjusted.append(contentsOf: [Float](repeating: 0, count: expected - adjusted.count))
         }
-        #if DEBUG
         assert(
             timing.frameCount == entry.frameCount,
             "Phase B re-run produced \(timing.frameCount) frames where Phase A said \(entry.frameCount)"
         )
-        #endif
 
         // The leading silence is already zeros: the file was created at full
         // length and unwritten regions read as silence, so there is nothing to
@@ -221,6 +219,43 @@ public actor SynthesisCoordinator {
         try writer.write(samples: adjusted, atFrame: entry.startFrame)
         progress.renderedChunks.insert(index)
     }
+
+    /// §8.5 — a footnote body renders to its own file. The main CAF's layout was
+    /// fixed by Phase A and has no room for a note in it; a side file keeps the
+    /// main timeline position from moving, which is the one thing §8.5 insists on.
+    public func renderFootnote(chunks: [PhonemizedChunk], blocks: [Block], to url: URL) throws {
+        let layout = StreamLayout(chunks: chunks, timings: timings, blocks: blocks)
+        let writer = try CAFWriter(url: url, totalFrames: layout.totalFrames)
+        defer { try? writer.close() }
+        for entry in layout.entries {
+            let (samples, _) = try runner.render(chunk: entry.chunk)
+            try writer.write(samples: samples, atFrame: entry.startFrame)
+        }
+    }
+
+    /// Rebuilds the Phase A state from a cached sidecar so an interrupted Phase B
+    /// can pick up where it stopped. §7.2's prosody pass is cheap but not free,
+    /// and re-running it would also risk landing on different rounded durations
+    /// than the audio already on disk was written against.
+    public func restore(
+        mainChunks: [PhonemizedChunk],
+        footnoteChunks: [UUID: [PhonemizedChunk]],
+        chunkTimings: [ChunkTiming],
+        blocks: [Block]
+    ) {
+        timings = [:]
+        for timing in chunkTimings { timings[timing.chunkID] = timing }
+        let layout = StreamLayout(chunks: mainChunks, timings: timings, blocks: blocks)
+        self.layout = layout
+        progress = RenderProgress(
+            renderedChunks: [],
+            totalChunks: layout.entries.count,
+            chunkFrameOffsets: layout.chunkFrameOffsets
+        )
+    }
+
+    /// Everything Phase A computed, for the sidecar.
+    public func allChunkTimings() -> [ChunkTiming] { Array(timings.values) }
 
     public func currentProgress() -> RenderProgress { progress }
 

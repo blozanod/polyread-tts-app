@@ -20,7 +20,7 @@ public struct Normalizer: Sendable {
     public init() {}
 
     public func normalize(_ blocks: [Block]) -> [Block] {
-        let out = blocks.map(normalize(_:))
+        let out = blocks.map { normalize($0) }
         SpanInvariant.check(out, stage: "Normalizer.normalize")
         return out
     }

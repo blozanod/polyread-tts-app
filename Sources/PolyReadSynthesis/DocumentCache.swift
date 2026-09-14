@@ -55,6 +55,20 @@ public struct DocumentCache: Sendable {
         directory(for: hash).appendingPathComponent("audio.caf")
     }
 
+    /// The source PDF, copied in at import. A reading is 1–20 MB against 260 MB
+    /// of audio, and the alternative is that §10's page surface silently stops
+    /// working the second time a document is opened.
+    public func pdfURL(for hash: String) -> URL {
+        directory(for: hash).appendingPathComponent("source.pdf")
+    }
+
+    public func storePDF(from url: URL, hash: String) throws {
+        try prepareDirectory(for: hash)
+        let destination = pdfURL(for: hash)
+        guard !FileManager.default.fileExists(atPath: destination.path) else { return }
+        try FileManager.default.copyItem(at: url, to: destination)
+    }
+
     func sidecarURL(for hash: String) -> URL {
         directory(for: hash).appendingPathComponent("sidecar.json")
     }

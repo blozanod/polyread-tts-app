@@ -17,7 +17,7 @@ struct ProtoBlock {
     var columnIndex: Int
     var glyphHeight: CGFloat
     var lineCount: Int
-    var label: String?              // footnote bodies only
+    var label: String? = nil        // footnote bodies only
     var id: UUID = UUID()
 
     var text: String { tokens.map(\.text).joined(separator: " ") }

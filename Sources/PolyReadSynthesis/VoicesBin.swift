@@ -28,7 +28,7 @@ public struct VoicesBin: Sendable {
             throw PolyReadError.voicesFileMalformed("file is \(data.count) bytes, shorter than the header")
         }
 
-        let magic = String(decoding: data[0..<7], as: UTF8.self)
+        let magic = String(decoding: data[data.startIndex..<(data.startIndex + 7)], as: UTF8.self)
         guard magic == Self.magic else {
             throw PolyReadError.voicesFileMalformed("magic is \"\(magic)\", expected \"\(Self.magic)\"")
         }
@@ -63,7 +63,7 @@ public struct VoicesBin: Sendable {
         let floatStart = data.startIndex + Self.headerSize + namesSize
         var styles = [Float](repeating: 0, count: floatCount)
         styles.withUnsafeMutableBytes { destination in
-            data.copyBytes(
+            _ = data.copyBytes(
                 to: destination.bindMemory(to: UInt8.self),
                 from: floatStart..<(floatStart + floatCount * MemoryLayout<Float>.size)
             )

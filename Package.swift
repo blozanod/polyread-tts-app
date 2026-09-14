@@ -41,7 +41,7 @@ let package = Package(
             name: "PolyReadUI",
             dependencies: [
                 "PolyReadCore", "PolyReadExtraction", "PolyReadLinguistics",
-                "PolyReadSynthesis", "PolyReadPlayback",
+                "PolyReadSynthesis", "PolyReadPlayback", "PolyReadBench",
             ]
         ),
 

@@ -1,0 +1,44 @@
+# XcodeGen spec — the fallback path.
+#
+# PolyRead.xcodeproj is checked in and should open directly. If Xcode ever
+# refuses to parse it (a hand-written pbxproj is a hand-written pbxproj), throw
+# it away and regenerate:
+#
+#     brew install xcodegen && xcodegen generate
+#
+# Both routes produce the same thing: one universal iOS 18 app target whose only
+# source file is the SwiftUI entry point, with everything else coming from the
+# local Swift package in this directory.
+
+name: PolyRead
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+
+packages:
+  PolyRead:
+    path: .
+
+targets:
+  PolyRead:
+    type: application
+    platform: iOS
+    # §1 — "One universal target. Size class selects the listening surface
+    # (§10), not a separate app."
+    deviceFamily: [1, 2]
+    sources:
+      - path: App/PolyRead
+    dependencies:
+      - package: PolyRead
+        product: PolyReadUI
+    info:
+      path: App/PolyRead/Info.plist
+    settings:
+      base:
+        SWIFT_VERSION: "6.0"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: App/PolyRead/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.PolyRead
+        TARGETED_DEVICE_FAMILY: "1,2"

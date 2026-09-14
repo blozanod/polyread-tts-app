@@ -19,6 +19,11 @@ public struct DocumentSidecar: Sendable, Codable {
     public let voiceName: String
     public let blocks: [Block]
     public let words: [WordTiming]
+    /// Phase A's inputs and outputs, kept so a document whose Phase B was
+    /// interrupted resumes rendering without paying for prosody a second time.
+    public let mainChunks: [PhonemizedChunk]
+    public let footnoteChunks: [UUID: [PhonemizedChunk]]
+    public let chunkTimings: [ChunkTiming]
     public let reflow: ReflowDocument
     /// Footnote bodies are not in the main stream, so they get their own
     /// timelines, keyed by the footnote body block's id.
@@ -33,6 +38,9 @@ public struct DocumentSidecar: Sendable, Codable {
         voiceName: String,
         blocks: [Block],
         words: [WordTiming],
+        mainChunks: [PhonemizedChunk],
+        footnoteChunks: [UUID: [PhonemizedChunk]],
+        chunkTimings: [ChunkTiming],
         reflow: ReflowDocument,
         footnoteTimelines: [UUID: [WordTiming]],
         createdAt: Date = Date()
@@ -44,6 +52,9 @@ public struct DocumentSidecar: Sendable, Codable {
         self.voiceName = voiceName
         self.blocks = blocks
         self.words = words
+        self.mainChunks = mainChunks
+        self.footnoteChunks = footnoteChunks
+        self.chunkTimings = chunkTimings
         self.reflow = reflow
         self.footnoteTimelines = footnoteTimelines
         self.createdAt = createdAt
