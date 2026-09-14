@@ -28,21 +28,33 @@ jobs:
           xcodebuild -version
           swift --version
 
-      - name: List available iOS simulators
-        run: xcrun simctl list devices available
-
       - name: Show available schemes
         run: xcodebuild -list
+
+      - name: Pick a valid iOS Simulator destination
+        id: destination
+        run: |
+          set -o pipefail
+          # Runners ship several Xcode versions side by side; `simctl list`
+          # shows every simulator on the machine regardless of which Xcode
+          # created it, but the *active* xcodebuild can only target runtimes
+          # it actually supports — hardcoding a name/OS guess (twice, now)
+          # has failed. Ask xcodebuild itself what this scheme can target.
+          xcodebuild -showdestinations -scheme PolyReadAllTests 2>&1 | tee /tmp/destinations.txt
+          id=$(grep -o 'platform:iOS Simulator, id:[0-9A-F-]*' /tmp/destinations.txt | head -1 | sed 's/.*id://')
+          if [ -z "$id" ]; then
+            echo "::error::No iOS Simulator destination found for scheme PolyReadAllTests"
+            exit 1
+          fi
+          echo "Using destination id=$id"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
 
       - name: Build and test PolyRead package
         run: |
           set -o pipefail
-          # None of xcodebuild's auto-generated schemes for a bare Package.swift
-          # (package-level or per-product) have a Test action configured when
-          # the package has never been opened in the Xcode GUI. So this repo
-          # checks in an explicit scheme —
-          # .swiftpm/xcode/xcshareddata/xcschemes/PolyReadAllTests.xcscheme —
-          # that builds and tests all four test targets.
+          # .swiftpm/xcode/xcshareddata/xcschemes/PolyReadAllTests.xcscheme is
+          # a checked-in scheme with a Test action covering all four test
+          # targets — xcodebuild's auto-generated schemes don't have one.
           xcodebuild test \
             -scheme PolyReadAllTests \
-            -destination 'platform=iOS Simulator,name=iPhone 16'
+            -destination "id=${{ steps.destination.outputs.id }}"
