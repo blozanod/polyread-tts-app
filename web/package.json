@@ -1,0 +1,46 @@
+{
+  "name": "polyread-web",
+  "productName": "PolyRead",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PDF reader that speaks academic readings aloud with word-level highlighting. Runs entirely on your machine.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist-electron/main.cjs",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "assets": "node scripts/fetch-assets.mjs",
+    "electron:build": "node scripts/build-electron.mjs",
+    "desktop": "npm run build && npm run electron:build && electron .",
+    "dist": "npm run build && npm run electron:build && electron-builder",
+    "dist:linux": "npm run build && npm run electron:build && electron-builder --linux",
+    "dist:win": "npm run build && npm run electron:build && electron-builder --win",
+    "dist:mac": "npm run build && npm run electron:build && electron-builder --mac"
+  },
+  "dependencies": {
+    "onnxruntime-web": "^1.20.1",
+    "pdfjs-dist": "^4.10.38",
+    "phonemizer": "^1.2.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3",
+    "vitest": "^2.1.8"
+  },
+  "optionalDependencies": {
+    "tesseract.js": "^5.1.1"
+  }
+}

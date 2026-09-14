@@ -1,0 +1,64 @@
+# Desktop packaging. Every target here builds from a Linux box except `mac`,
+# which needs macOS for the code-signing tools even when the build is unsigned —
+# hence the GitHub Actions matrix in ../.github/workflows/desktop.yml.
+appId: me.blozanod.polyread
+productName: PolyRead
+copyright: Apache-2.0
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - dist/**/*
+  - dist-electron/**/*
+  - package.json
+
+# The model files need no entry here. `npm run assets` writes them into
+# public/models, Vite copies public/ into dist/ at build time, and `files`
+# above already takes all of dist/ — so an installer built after `npm run
+# assets` is fully offline, and one built without it is not. The same directory
+# layout is what a static host serves, so the desktop app and the website load
+# their model from the identical relative path.
+
+asar: true
+asarUnpack:
+  # onnxruntime-web and pdf.js load these by URL; inside an asar they cannot be.
+  - "**/*.wasm"
+
+mac:
+  category: public.app-category.productivity
+  target:
+    - target: dmg
+      arch: [arm64, x64]
+  darkModeSupport: true
+  # Unsigned: a personal build. Gatekeeper will need one right-click > Open.
+  identity: null
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+
+linux:
+  category: Office
+  target:
+    - target: AppImage
+      arch: [x64]
+    - target: deb
+      arch: [x64]
+  desktop:
+    entry:
+      MimeType: application/pdf
+
+fileAssociations:
+  - ext: pdf
+    name: PDF
+    role: Viewer

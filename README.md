@@ -1,7 +1,25 @@
 # PolyRead
 
-Personal iOS/iPadOS PDF reader that speaks poli-sci readings aloud with
-word-level highlighting. Built to [`docs/polyread-spec-v2.md`](docs/polyread-spec-v2.md).
+PDF reader that speaks poli-sci readings aloud with word-level highlighting.
+Built to [`docs/polyread-spec-v2.md`](docs/polyread-spec-v2.md).
+
+There are two builds in this repository:
+
+| | Where | Status |
+|---|---|---|
+| [**`web/`**](web/README.md) | Browser, and macOS / Windows / Linux desktop apps | Builds, tested, runs |
+| `Sources/`, `App/` | iOS / iPadOS | Written to spec, **never compiled** — see below |
+
+The web build is a full port of the same pipeline: the §3 types, §4's extraction
+and layout rules, §5's normalization and its span invariant, §6's chunking, §7's
+two phases, §8's transport and highlight sync, and both §10 surfaces. It runs
+entirely on the machine it is open on — the PDF is never uploaded and the
+synthesis is local. [`web/README.md`](web/README.md) has the eight places it
+departs from the iOS build and why, and one of those is a bug in the phoneme
+vocabulary that the iOS build shipped.
+
+Start there unless you specifically want the iOS app. Everything below concerns
+the iOS build.
 
 ---
 
