@@ -1,0 +1,9 @@
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.mlmodelc
+Models/*.mlpackage
+Models/Voices.bin
