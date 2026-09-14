@@ -31,9 +31,22 @@ jobs:
       - name: List available iOS simulators
         run: xcrun simctl list devices available
 
+      - name: Show available schemes
+        run: xcodebuild -list
+
       - name: Build and test PolyRead package
         run: |
           set -o pipefail
-          xcodebuild test \
-            -scheme PolyRead \
-            -destination 'platform=iOS Simulator,name=iPhone 16'
+          status=0
+          # The package-level "PolyRead" scheme Xcode auto-generates has no
+          # Test action enabled. Each library product gets its own
+          # auto-generated scheme whose Test action runs the test target(s)
+          # that depend on it, so target those instead.
+          for scheme in PolyReadCore PolyReadExtraction PolyReadLinguistics PolyReadSynthesis; do
+            echo "::group::Testing scheme $scheme"
+            xcodebuild test \
+              -scheme "$scheme" \
+              -destination 'platform=iOS Simulator,name=iPhone 16' || status=1
+            echo "::endgroup::"
+          done
+          exit $status
