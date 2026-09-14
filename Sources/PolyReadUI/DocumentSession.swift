@@ -92,6 +92,14 @@ public final class DocumentSession: ObservableObject {
     }
 
     private func beginImport(url: URL, confirmedLowConfidence: Bool) async {
+        // Opening a second document without closing the first would leave the
+        // first one's Phase B running, writing into a CAF nothing is reading and
+        // competing for the Neural Engine with the import that replaced it.
+        phaseBTask?.cancel()
+        phaseBTask = nil
+        coordinator = nil
+        playback.unload()
+
         // Security-scoped access: the picker hands back a URL outside the
         // sandbox, and reading it without this silently yields nothing.
         let scoped = url.startAccessingSecurityScopedResource()
@@ -126,9 +134,10 @@ public final class DocumentSession: ObservableObject {
             }
 
             stage = .extracting(pagesDone: 0, pagesTotal: max(1, document?.pageCount ?? 1))
-            let extraction = try await Task.detached(priority: .userInitiated) {
+            let extraction = try await Task.detached(priority: .userInitiated) { [weak self] in
                 try extractor.extract(url: url, decision: decision) { done, total in
                     Task { @MainActor in
+                        guard let self, case .extracting = self.stage else { return }
                         self.stage = .extracting(pagesDone: done, pagesTotal: total)
                     }
                 }
@@ -152,6 +161,7 @@ public final class DocumentSession: ObservableObject {
                 title: extraction.title,
                 pageCount: extraction.pageCount
             )
+            pendingURL = nil
         } catch {
             stage = .failed(error.localizedDescription)
         }
