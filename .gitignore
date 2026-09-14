@@ -7,3 +7,5 @@ xcuserdata/
 *.mlmodelc
 Models/*.mlpackage
 Models/Voices.bin
+__pycache__/
+*.pyc
