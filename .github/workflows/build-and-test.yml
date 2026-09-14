@@ -27,26 +27,10 @@ jobs:
           xcodebuild -version
           swift --version
 
-      - name: Show available schemes
-        run: xcodebuild -list
-
-      - name: Pick a valid iOS Simulator destination
-        id: destination
+      - name: Show available schemes and SDKs
         run: |
-          set -o pipefail
-          # Runners ship several Xcode versions side by side; `simctl list`
-          # shows every simulator on the machine regardless of which Xcode
-          # created it, but the *active* xcodebuild can only target runtimes
-          # it actually supports — hardcoding a name/OS guess (twice, now)
-          # has failed. Ask xcodebuild itself what this scheme can target.
-          xcodebuild -showdestinations -scheme PolyReadAllTests 2>&1 | tee /tmp/destinations.txt
-          id=$(grep -o 'platform:iOS Simulator, id:[0-9A-F-]*' /tmp/destinations.txt | head -1 | sed 's/.*id://')
-          if [ -z "$id" ]; then
-            echo "::error::No iOS Simulator destination found for scheme PolyReadAllTests"
-            exit 1
-          fi
-          echo "Using destination id=$id"
-          echo "id=$id" >> "$GITHUB_OUTPUT"
+          xcodebuild -list
+          xcodebuild -showsdks
 
       - name: Build and test PolyRead package
         run: |
@@ -54,6 +38,16 @@ jobs:
           # .swiftpm/xcode/xcshareddata/xcschemes/PolyReadAllTests.xcscheme is
           # a checked-in scheme with a Test action covering all four test
           # targets — xcodebuild's auto-generated schemes don't have one.
+          #
+          # `xcodebuild -showdestinations` against that scheme (tried
+          # previously) fails outright: its buildables are XCTest bundles,
+          # which can never satisfy a Run/Launch action, so xcodebuild
+          # refuses to resolve anything for it regardless of the scheme's
+          # buildForRunning flag. So this pins a destination directly instead
+          # of trying to auto-discover one: iPhone 16 on iOS 18.5, which the
+          # runner's active Xcode 16.4 (confirmed via `xcodebuild -version`
+          # earlier in this job) ships paired with, and which the simulator
+          # list from an earlier run confirmed exists on this runner image.
           xcodebuild test \
             -scheme PolyReadAllTests \
-            -destination "id=${{ steps.destination.outputs.id }}"
+            -destination 'platform=iOS Simulator,name=iPhone 16,OS=18.5'
