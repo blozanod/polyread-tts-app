@@ -24,11 +24,7 @@ extension FallbackPhonemizer {
         }
 
         static func word(_ text: String) -> String {
-            FallbackPhonemizer.Lexicon.exceptions[text]
-                ?? FallbackPhonemizer.Stress.assign(
-                    FallbackPhonemizer.applyRules(Array(text)),
-                    spelling: text
-                )
+            FallbackPhonemizer.convertWord(text)
         }
 
         static let ones = [

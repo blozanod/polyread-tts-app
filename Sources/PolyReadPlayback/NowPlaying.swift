@@ -39,6 +39,13 @@ public final class NowPlayingController {
     public func install(handlers: Handlers) {
         self.handlers = handlers
         let center = MPRemoteCommandCenter.shared()
+        // Opening a second document without closing the first would otherwise
+        // stack handlers, and one lock-screen tap would skip thirty seconds.
+        center.playCommand.removeTarget(nil)
+        center.pauseCommand.removeTarget(nil)
+        center.skipForwardCommand.removeTarget(nil)
+        center.skipBackwardCommand.removeTarget(nil)
+        center.changePlaybackPositionCommand.removeTarget(nil)
 
         center.playCommand.isEnabled = true
         center.playCommand.addTarget { [weak self] _ in

@@ -76,7 +76,9 @@ public struct FallbackPhonemizer: Phonemizer {
 
     static func convertWord(_ word: String) -> String {
         let lowercased = word.lowercased()
-        if let exception = Lexicon.exceptions[lowercased] { return exception }
+        if let exception = Lexicon.exceptions[lowercased] {
+            return Stress.assignIfPolysyllabic(exception, spelling: lowercased)
+        }
 
         // An all-caps token of 2–5 letters is an initialism far more often than a
         // word — APSR, NATO is the exception, not the rule, in this corpus.

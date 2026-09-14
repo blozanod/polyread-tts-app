@@ -91,11 +91,21 @@ struct PhonemizerTests {
         #expect(badNames.isEmpty, "\(badNames)")
     }
 
-    @Test("stress is assigned exactly once per word")
+    @Test("a polysyllabic word gets exactly one stress mark")
     func stress() {
-        for word in ["politics", "democracy", "institution", "state", "reconsider"] {
+        // Both paths: "politics" and "democracy" come from the dictionary,
+        // "reconsider" and "comparative" from the rules.
+        for word in ["politics", "democracy", "institution", "reconsider", "comparative"] {
             let phonemes = FallbackPhonemizer.convertWord(word)
             #expect(phonemes.filter { $0 == "ˈ" }.count == 1, "\(word) -> \(phonemes)")
+        }
+    }
+
+    /// Marking every "the" and "of" would be worse prosody than marking none.
+    @Test("monosyllabic function words stay unstressed")
+    func functionWordsUnstressed() {
+        for word in ["the", "of", "as", "was", "in"] {
+            #expect(!FallbackPhonemizer.convertWord(word).contains("ˈ"), word)
         }
     }
 

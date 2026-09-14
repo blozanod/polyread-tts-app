@@ -133,12 +133,27 @@ public struct Chunker: Sendable {
             }
             cut = max(cut, wordIndex + 1)
 
-            let sliceEnd = ranges[cut - 1].upperBound
+            var sliceEnd = ranges[cut - 1].upperBound
+            var chunkRanges = rebased(Array(ranges[wordIndex..<cut]), by: chunkStart)
+
+            // A single "word" longer than the whole budget is not English — it is
+            // a URL, or two pages of a scan that came back without spaces. The
+            // model's input is capped at [1, 3…512], so it has to be cut
+            // somewhere; cutting is better than throwing away the paragraph
+            // around it or trapping the debug assert in LinguisticsPipeline.
+            if sliceEnd - chunkStart > Self.budget {
+                sliceEnd = chunkStart + Self.budget
+                chunkRanges = chunkRanges.map { range in
+                    range.lowerBound..<min(range.upperBound, Self.budget)
+                }
+                .map { $0.lowerBound <= $0.upperBound ? $0 : $0.lowerBound..<$0.lowerBound }
+            }
+
             chunks.append(
                 PhonemizedChunk(
                     blockID: blockID,
                     tokens: Array(tokenIDs[chunkStart..<sliceEnd]),
-                    wordPhonemeRanges: rebased(Array(ranges[wordIndex..<cut]), by: chunkStart),
+                    wordPhonemeRanges: chunkRanges,
                     spanOffset: wordIndex
                 )
             )
@@ -153,17 +168,36 @@ public struct Chunker: Sendable {
     }
 
     /// Sentence-final on the *source* token, not the phonemes — "Putnam." is a
-    /// sentence end and "et al" is not, and only the orthography knows that.
+    /// sentence end and "Vol." is not, and only the orthography knows that.
+    ///
+    /// Being wrong here is cheap in one direction and not the other: a missed
+    /// sentence end just means the split falls on a word boundary instead, while
+    /// a false one puts a chunk break inside a sentence. So the abbreviation
+    /// tests are deliberately generous.
     func isSentenceEnd(_ token: String) -> Bool {
         let trimmed = token.trimmingCharacters(in: CharacterSet(charactersIn: "\"'”’)]}"))
         guard let last = trimmed.last else { return false }
         guard last == "." || last == "!" || last == "?" else { return false }
-        // An initial ("J. S. Mill") or a surviving abbreviation is not a sentence.
+        // "!" and "?" are never abbreviation marks.
+        guard last == "." else { return true }
+
         let core = String(trimmed.dropLast())
+        // An initial: "J. S. Mill".
         if core.count <= 1 { return false }
-        if core.allSatisfy(\.isUppercase) && core.count <= 3 { return false }
-        return true
+        // An internal period: "U.S.", and anything §5 did not rewrite.
+        if core.contains(".") { return false }
+        return !Self.abbreviations.contains(core.lowercased())
     }
+
+    /// Abbreviations that survive §5 — its table covers the ones that need
+    /// *reading* differently, which is a different list from the ones that merely
+    /// end in a period.
+    nonisolated(unsafe) static let abbreviations: Set<String> = [
+        "vol", "vols", "no", "nos", "ed", "eds", "ch", "chap", "chaps", "fig",
+        "figs", "tab", "tabs", "pp", "esp", "vs", "mr", "mrs", "ms", "dr",
+        "prof", "st", "jr", "sr", "rev", "trans", "repr", "sec", "secs", "nn",
+        "cit", "ff", "inc", "dept", "univ", "co", "corp", "et", "al", "cf",
+    ]
 }
 
 /// Runs the whole of Agent B over a document: §5 then §6.

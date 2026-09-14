@@ -64,10 +64,12 @@ public final class DocumentSession: ObservableObject {
     public init() {
         cache = try? DocumentCache(byteLimit: settings.cacheByteLimit)
         playback.renderOnDemand = { [weak self] time in
-            await self?.renderOnDemand(at: time) ?? false
+            guard let self else { return false }
+            return await self.renderOnDemand(at: time)
         }
         playback.prepareFootnote = { [weak self] blockID in
-            await self?.prepareFootnote(blockID: blockID)
+            guard let self else { return nil }
+            return await self.prepareFootnote(blockID: blockID)
         }
     }
 

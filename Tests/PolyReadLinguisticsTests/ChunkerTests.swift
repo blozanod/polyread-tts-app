@@ -108,13 +108,38 @@ struct ChunkerTests {
         #expect(boundaries == chunks.count - 1, "\(boundaries) of \(chunks.count - 1) splits landed on a sentence end")
     }
 
-    @Test("an initial is not a sentence end")
+    /// A "word" this long is a URL or a scan that came back without spaces. The
+    /// model's input is capped, so it has to be cut rather than crash the import.
+    @Test("a single token longer than the budget is cut, not passed through")
+    func pathologicalToken() {
+        let tokens = [Int32](repeating: 50, count: 700)
+        let chunks = chunker.split(
+            blockID: UUID(),
+            tokenIDs: tokens,
+            ranges: [0..<700],
+            tokens: ["aaaa"]
+        )
+        #expect(chunks.count == 1)
+        #expect(chunks[0].tokens.count == Chunker.budget)
+        for range in chunks[0].wordPhonemeRanges {
+            #expect(range.upperBound <= chunks[0].tokens.count)
+            #expect(range.lowerBound <= range.upperBound)
+        }
+    }
+
+    @Test("an initial or an abbreviation is not a sentence end")
     func abbreviations() {
         #expect(chunker.isSentenceEnd("shows."))
         #expect(chunker.isSentenceEnd("vote?"))
         #expect(chunker.isSentenceEnd("argued.\""))
-        #expect(!chunker.isSentenceEnd("J."))
-        #expect(!chunker.isSentenceEnd("APSR."))
+        // An acronym at the end of a sentence really is the end of a sentence.
+        #expect(chunker.isSentenceEnd("APSR."))
+
+        #expect(!chunker.isSentenceEnd("J."))         // an initial
+        #expect(!chunker.isSentenceEnd("U.S."))       // an internal period
+        #expect(!chunker.isSentenceEnd("Vol."))       // an abbreviation
+        #expect(!chunker.isSentenceEnd("eds."))
         #expect(!chunker.isSentenceEnd("word"))
+        #expect(!chunker.isSentenceEnd(""))
     }
 }

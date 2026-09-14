@@ -28,6 +28,29 @@ extension FallbackPhonemizer {
             "ious", "eous", "uous", "graphy", "logy", "cracy", "ogy", "ify",
         ]
 
+        /// For dictionary entries. A monosyllabic function word — "the", "of",
+        /// "as" — is unstressed in running speech, and marking every one of them
+        /// would be worse prosody than marking none. Anything longer gets the
+        /// same treatment as a word that came through the rules.
+        static func assignIfPolysyllabic(_ phonemes: String, spelling: String) -> String {
+            guard !phonemes.contains(primary), syllableCount(phonemes: phonemes) > 1 else {
+                return phonemes
+            }
+            return assign(phonemes, spelling: spelling)
+        }
+
+        /// Counts nuclei, collapsing diphthongs: "eɪ" is one syllable, not two.
+        static func syllableCount(phonemes: String) -> Int {
+            var count = 0
+            var previousWasNucleus = false
+            for character in phonemes {
+                let isNucleus = vowelNuclei.contains(character)
+                if isNucleus, !previousWasNucleus { count += 1 }
+                previousWasNucleus = isNucleus
+            }
+            return count
+        }
+
         static func assign(_ phonemes: String, spelling: String) -> String {
             guard !phonemes.isEmpty, !phonemes.contains(primary) else { return phonemes }
 
@@ -67,13 +90,53 @@ extension FallbackPhonemizer {
             return count
         }
 
+        /// Two-consonant clusters English allows at the start of a syllable.
+        /// Everything else in a cluster belongs to the *previous* syllable's coda.
+        static let validOnsets: Set<String> = [
+            "pɹ", "pl", "pj", "bɹ", "bl", "bj", "tɹ", "tw", "tj", "dɹ", "dw",
+            "kɹ", "kl", "kw", "kj", "ɡɹ", "ɡl", "fɹ", "fl", "fj", "vj", "θɹ",
+            "θw", "ʃɹ", "sp", "st", "sk", "sl", "sm", "sn", "sw", "sj", "mj",
+            "hj", "nj", "lj", "bj",
+        ]
+
         /// The stress mark goes at the start of the syllable's onset, not on the
         /// vowel itself — so "ˈpɑlɪtɪks", not "pˈɑlɪtɪks".
+        ///
+        /// Which consonants count as the onset is the maximal-onset principle,
+        /// not "all of them": "comparative" is kəm-ˈpæ-ɹə-tɪv, so the /m/ closes
+        /// the previous syllable and only the /p/ opens the stressed one.
+        /// Walking back over the whole cluster would give "kəˈmpæɹətɪv", which
+        /// Kokoro reads with the stress a syllable early.
         static func insert(_ mark: String, into characters: [Character], before nucleus: Int) -> String {
-            var onset = nucleus
-            while onset > 0, !vowelNuclei.contains(characters[onset - 1]) {
-                onset -= 1
+            var clusterStart = nucleus
+            while clusterStart > 0, !vowelNuclei.contains(characters[clusterStart - 1]) {
+                clusterStart -= 1
             }
+
+            var onset = nucleus
+            if clusterStart == 0 {
+                // Word-initial: there is no previous syllable to take a coda, so
+                // the whole cluster is the onset however unlikely it looks.
+                onset = 0
+            } else {
+                let cluster = String(characters[clusterStart..<nucleus])
+                if cluster.count >= 2 {
+                    // Longest valid suffix of the cluster, preferring "stɹ"-style
+                    // three-consonant onsets.
+                    let chars = Array(cluster)
+                    if chars.count >= 3, chars[chars.count - 3] == "s",
+                       validOnsets.contains(String(chars.suffix(2))) {
+                        onset = nucleus - 3
+                    } else if validOnsets.contains(String(chars.suffix(2))) {
+                        onset = nucleus - 2
+                    } else {
+                        onset = nucleus - 1
+                    }
+                } else {
+                    onset = clusterStart
+                }
+            }
+
             var out = String(characters[0..<onset])
             out += mark
             out += String(characters[onset...])

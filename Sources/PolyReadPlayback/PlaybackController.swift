@@ -172,7 +172,7 @@ public final class PlaybackController: ObservableObject {
     }
 
     private func renderThenPlay(at time: TimeInterval) async {
-        let rendered = await renderOnDemand?(time) ?? false
+        let rendered = await (renderOnDemand?(time)) ?? false
         guard rendered else {
             isPlaying = false
             return
@@ -243,7 +243,10 @@ public final class PlaybackController: ObservableObject {
         pause()
 
         Task { @MainActor in
-            guard let prepared = await self.prepareFootnote?(footnoteBodyID) else {
+            guard
+                let prepare = self.prepareFootnote,
+                let prepared = await prepare(footnoteBodyID)
+            else {
                 if wasPlaying { self.play() }
                 return
             }

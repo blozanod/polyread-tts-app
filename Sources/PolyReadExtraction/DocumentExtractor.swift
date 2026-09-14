@@ -13,7 +13,7 @@ public struct ExtractionResult: Sendable {
 }
 
 /// Agent A — §4. PDF URL in, `[Block]` out, source-agnostic from §4.2 onward.
-public struct DocumentExtractor {
+public struct DocumentExtractor: Sendable {
 
     public typealias ProgressHandler = @Sendable (_ pagesDone: Int, _ pagesTotal: Int) -> Void
 

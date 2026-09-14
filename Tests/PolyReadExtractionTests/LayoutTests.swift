@@ -103,8 +103,13 @@ struct FurnitureTests {
                 columnIndex: 0,
                 pageIndex: pageIndex
             )
+            // Real footnotes differ page to page; identical text on every page
+            // would be a running head and should classify as one.
             let note = Line(
-                runs: line(["a", "footnote", "body", "down", "here"], x: 72, y: 50, glyph: 8, pageIndex: pageIndex),
+                runs: line(
+                    ["a", "footnote", "about", "topic\(pageIndex)"],
+                    x: 72, y: 50, glyph: 8, pageIndex: pageIndex
+                ),
                 columnIndex: 0,
                 pageIndex: pageIndex
             )
