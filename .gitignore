@@ -1,6 +1,8 @@
 .DS_Store
 .build/
-.swiftpm/
+# Ephemeral workspace state SwiftPM/Xcode regenerates on open — but not
+# .swiftpm/xcode/xcshareddata/xcschemes/, which holds the checked-in CI scheme.
+.swiftpm/xcode/package.xcworkspace/
 DerivedData/
 *.xcuserstate
 xcuserdata/

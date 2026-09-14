@@ -37,16 +37,12 @@ jobs:
       - name: Build and test PolyRead package
         run: |
           set -o pipefail
-          status=0
-          # The package-level "PolyRead" scheme Xcode auto-generates has no
-          # Test action enabled. Each library product gets its own
-          # auto-generated scheme whose Test action runs the test target(s)
-          # that depend on it, so target those instead.
-          for scheme in PolyReadCore PolyReadExtraction PolyReadLinguistics PolyReadSynthesis; do
-            echo "::group::Testing scheme $scheme"
-            xcodebuild test \
-              -scheme "$scheme" \
-              -destination 'platform=iOS Simulator,name=iPhone 16' || status=1
-            echo "::endgroup::"
-          done
-          exit $status
+          # None of xcodebuild's auto-generated schemes for a bare Package.swift
+          # (package-level or per-product) have a Test action configured when
+          # the package has never been opened in the Xcode GUI. So this repo
+          # checks in an explicit scheme —
+          # .swiftpm/xcode/xcshareddata/xcschemes/PolyReadAllTests.xcscheme —
+          # that builds and tests all four test targets.
+          xcodebuild test \
+            -scheme PolyReadAllTests \
+            -destination 'platform=iOS Simulator,name=iPhone 16'
