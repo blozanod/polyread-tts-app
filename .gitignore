@@ -9,3 +9,8 @@ Models/*.mlpackage
 Models/Voices.bin
 __pycache__/
 *.pyc
+
+# scripts/make-duration-model.py wants onnx and onnxruntime, which is a
+# virtualenv most people will put right here.
+.venv/
+venv/

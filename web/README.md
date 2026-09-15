@@ -47,22 +47,30 @@ node scripts/fetch-assets.mjs --list
 
 Then pick a precision:
 
-| `--dtype` | Roughly | Use it when |
+| `--dtype` | Size | Use it when |
 |---|---|---|
-| `fp32` | ~330 MB | You have WebGPU and want the best quality |
-| `fp16` | ~170 MB | **Default.** Good on WebGPU, fine on CPU |
-| `q8` | ~90 MB | CPU only, or you care about download size |
-| `q4f16` | ~50 MB | You want it small and will accept some quality loss |
+| `fp32` | 310 MB | You have WebGPU and want the best quality |
+| `fp16` | 156 MB | **Default.** Good on WebGPU, fine on CPU |
+| `q8f16` | 82 MB | The smallest one worth having |
+| `q8` | 88 MB | CPU only, or you care about download size |
+| `uint8f16` | 109 MB | |
+| `q4f16` | 147 MB | |
+| `uint8` | 169 MB | |
+| `q4` | 291 MB | |
+
+Those are the published sizes, not estimates. Note that the quantized files are
+not ordered the way the names suggest — `q4` is nearly twice `q4f16` and larger
+than `fp16`, because only some of the graph is quantized in each. If you want
+small, `q8f16` is the one.
 
 ```sh
-node scripts/fetch-assets.mjs --dtype q8        # smaller, faster on CPU
-node scripts/fetch-assets.mjs --voices all      # every voice, +28 MB
+node scripts/fetch-assets.mjs --dtype q8f16     # smallest, fastest on CPU
+node scripts/fetch-assets.mjs --voices all      # all 55 voices, +28 MB
 node scripts/fetch-assets.mjs --voices-from-npm # voices from npm, if the Hub is blocked
 ```
 
-The sizes are what 82M parameters comes to at each precision; `--list` prints
-the real ones. If a dtype name does not match anything the repository has, the
-script prints every model file it found so you can pass one by name.
+If a dtype name does not match anything the repository has, the script prints
+every model file it found so you can pass one by name.
 
 ### Exact word timings
 

@@ -56,7 +56,8 @@ function parseArgs(argv) {
           "Usage: node scripts/fetch-assets.mjs [options]",
           "",
           "  --list                                 show what the repository publishes, and stop",
-          "  --dtype <fp32|fp16|q8|q4|q4f16|FILE>   model precision, or an exact filename (default fp16)",
+          "  --dtype <fp32|fp16|q8|q8f16|q4|q4f16|uint8|uint8f16|FILE>",
+          "                                         model precision, or an exact filename (default fp16)",
           "  --voices <default|all|a,b,c>           which voices (default: the B-and-better ones)",
           "  --voices-from-npm                      take voices from the kokoro-js package instead of the Hub",
           "  --repo <owner/name>                    a different model repository",
@@ -93,11 +94,13 @@ async function listRepo(repo) {
 const DTYPE_FILES = {
   fp32: ["model.onnx"],
   fp16: ["model_fp16.onnx"],
-  q8: ["model_quantized.onnx", "model_q8.onnx", "model_uint8.onnx"],
+  q8: ["model_quantized.onnx", "model_q8.onnx"],
+  q8f16: ["model_q8f16.onnx"],
   q4: ["model_q4.onnx"],
   q4f16: ["model_q4f16.onnx"],
   int8: ["model_int8.onnx"],
   uint8: ["model_uint8.onnx"],
+  uint8f16: ["model_uint8f16.onnx"],
 };
 
 function onnxFiles(files) {
