@@ -4,6 +4,7 @@ import { checkBlocks, violations } from "../core/spanInvariant";
 import { newID, type Block, type TextRun } from "../core/types";
 import {
   isHeading,
+  isPublisherBoilerplate,
   materialize,
   mergeAcrossPages,
   paragraphs,
@@ -134,7 +135,7 @@ export async function extractDocument(
     // Pass 2 — classify, tokenize, assemble.
     let proto: ProtoBlock[] = [];
     const footnoteBodies: ProtoBlock[] = [];
-    const markerBlocks: Array<{ marker: ProtoBlock; hostIndex: number; label: string }> = [];
+    const markerBlocks: Array<{ marker: ProtoBlock; hostID: string | undefined; label: string }> = [];
 
     for (let index = 0; index < pageCount; index++) {
       const lines = pageLines[index];
@@ -186,9 +187,19 @@ export async function extractDocument(
             lineCount: paragraph.length,
           };
           if (isHeading(block, bodyGlyphHeight)) block.role = "heading";
+          // A database's own front matter is furniture, whatever size it is set
+          // in. `runningHead` is the furniture role that keeps a block visible
+          // in the reflow view and out of the spoken stream, which is exactly
+          // what this wants.
+          if (isPublisherBoilerplate(protoText(block))) block.role = "runningHead";
           if (tokens.length > 0) proto.push(block);
 
-          const hostIndex = proto.length - 1;
+          // By id rather than by position: `mergeAcrossPages` below drops every
+          // block it absorbs, so an index taken here points at a different
+          // paragraph afterwards — the further into the document, the further
+          // out. A paragraph carrying no tokens of its own was never pushed, so
+          // its markers hang off the last block that was.
+          const hostID = tokens.length > 0 ? block.id : proto[proto.length - 1]?.id;
           for (const marker of markers) {
             markerBlocks.push({
               marker: {
@@ -200,7 +211,7 @@ export async function extractDocument(
                 glyphHeight: 0,
                 lineCount: 1,
               },
-              hostIndex,
+              hostID,
               label: marker.text,
             });
           }
@@ -251,7 +262,18 @@ export async function extractDocument(
 
     // §4.6 cross-page paragraph merge. Runs over main-stream blocks only —
     // footnote bodies were pulled out above and never straddle a page.
-    proto = mergeAcrossPages(proto);
+    const mergedInto = new Map<string, string>();
+    proto = mergeAcrossPages(proto, mergedInto);
+    /** Follows a block id through however many merges absorbed it. */
+    const survivingID = (id: string | undefined): string | undefined => {
+      let current = id;
+      const seen = new Set<string>();
+      while (current !== undefined && mergedInto.has(current) && !seen.has(current)) {
+        seen.add(current);
+        current = mergedInto.get(current);
+      }
+      return current;
+    };
 
     // Pair each marker with the footnote body it points at: same page, same
     // label. Falls back to the k-th note on the page when labels are symbols
@@ -264,10 +286,11 @@ export async function extractDocument(
     }
 
     const footnoteIDsByHost = new Map<string, string[]>();
-    const markersByHost = new Map<number, Array<{ marker: ProtoBlock; bodyID?: string }>>();
+    const markersByHost = new Map<string, Array<{ marker: ProtoBlock; bodyID?: string }>>();
     const markerOrdinal = new Map<number, number>();
+    const liveIDs = new Set(proto.map((b) => b.id));
 
-    for (const { marker, hostIndex, label } of markerBlocks) {
+    for (const { marker, hostID, label } of markerBlocks) {
       const page = marker.pageIndex;
       const ordinal = markerOrdinal.get(page) ?? 0;
       markerOrdinal.set(page, ordinal + 1);
@@ -276,16 +299,18 @@ export async function extractDocument(
       const matched = candidates.find((b) => b.label === label) ?? candidates[ordinal];
 
       marker.label = label;
-      if (matched && hostIndex >= 0 && hostIndex < proto.length) {
-        const hostID = proto[hostIndex].id;
-        const list = footnoteIDsByHost.get(hostID);
+      const host = survivingID(hostID);
+      if (host === undefined || !liveIDs.has(host)) continue;
+
+      if (matched) {
+        const list = footnoteIDsByHost.get(host);
         if (list) list.push(matched.id);
-        else footnoteIDsByHost.set(hostID, [matched.id]);
+        else footnoteIDsByHost.set(host, [matched.id]);
       }
-      const hostList = markersByHost.get(hostIndex);
+      const hostList = markersByHost.get(host);
       const entry = { marker, bodyID: matched?.id };
       if (hostList) hostList.push(entry);
-      else markersByHost.set(hostIndex, [entry]);
+      else markersByHost.set(host, [entry]);
     }
 
     // Interleave: each main block, then the markers that came out of it, then
@@ -295,7 +320,7 @@ export async function extractDocument(
     for (let i = 0; i < proto.length; i++) {
       const block = proto[i];
       blocks.push(materialize(block, footnoteIDsByHost.get(block.id) ?? []));
-      for (const { marker, bodyID } of markersByHost.get(i) ?? []) {
+      for (const { marker, bodyID } of markersByHost.get(block.id) ?? []) {
         blocks.push(materialize(marker, bodyID ? [bodyID] : []));
       }
       const isLastOnPage = i + 1 >= proto.length || proto[i + 1].pageIndex !== block.pageIndex;

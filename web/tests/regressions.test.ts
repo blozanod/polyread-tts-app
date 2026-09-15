@@ -4,7 +4,15 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { pdfAssetOptions } from "../src/extraction/pdfAssets";
-import { newID, textRange, type Block, type PhonemizedChunk, type SourceSpan, type TextRun } from "../src/core/types";
+import { isSpoken, newID, textRange, type Block, type PhonemizedChunk, type SourceSpan, type TextRun } from "../src/core/types";
+import {
+  isPublisherBoilerplate,
+  mergeAcrossPages,
+  protoText,
+  tokenizeParagraph,
+  type ProtoBlock,
+} from "../src/extraction/blockAssembler";
+import type { Line } from "../src/extraction/pageLayout";
 import { rect } from "../src/core/geometry";
 import { readingOrderCompare } from "../src/core/reflow";
 import { groupIntoLines, lineBaseline, lineText, orderRuns } from "../src/extraction/pageLayout";
@@ -425,6 +433,128 @@ describe("per-word baselines (a scanned text layer)", () => {
           if (ab === 0 && bc === 0) expect(Math.sign(readingOrderCompare(a, c))).toBe(0);
         }
       }
+    }
+  });
+});
+
+/**
+ * Three things a database-supplied PDF does that the pipeline got wrong, all
+ * found in the same JSTOR scan of Weinberg 1963.
+ */
+describe("a PDF as a database hands it over", () => {
+  const run = (text: string, x: number, baseline: number): TextRun => ({
+    text,
+    bbox: rect(x, baseline - 2, text.length * 5, 10),
+    glyphHeight: 10,
+    baseline,
+    pageIndex: 0,
+    columnIndex: 0,
+    orderIndex: 0,
+  });
+  const line = (runs: TextRun[]): Line => ({ runs, columnIndex: 0, pageIndex: 0 });
+
+  const proto = (id: string, page: number, words: string[]): ProtoBlock => ({
+    id,
+    role: "body",
+    tokens: words.map((text) => ({ text, bboxes: [rect(0, 0, 1, 1)], pageIndex: page })),
+    pageIndex: page,
+    columnIndex: 0,
+    glyphHeight: 10,
+    lineCount: 1,
+  });
+
+  /**
+   * A paragraph broken mid-word across a page break. `tokenizeParagraph` joins
+   * a hyphen within one paragraph and cannot reach across two, so this landed
+   * in the spoken stream as two tokens with a paragraph pause between them —
+   * the reader said "labora", paused, and said "tories".
+   */
+  it("joins a word hyphenated over a page break", () => {
+    const merged = mergeAcrossPages([
+      proto("a", 0, ["universities,", "governmental", "labora-"]),
+      proto("b", 1, ["tories", "and", "industry."]),
+    ]);
+    expect(merged).toHaveLength(1);
+    expect(protoText(merged[0])).toBe("universities, governmental laboratories and industry.");
+    // One spoken token, and both halves' boxes, as SourceSpan promises.
+    const joined = merged[0].tokens[merged[0].tokens.length - 3];
+    expect(joined.text).toBe("laboratories");
+    expect(joined.bboxes).toHaveLength(2);
+  });
+
+  /**
+   * A page break is joined by the same rule as a line break: every hyphen at a
+   * break is a soft one. A compound that breaks at its own hyphen loses it, in
+   * both places and identically — telling the two apart needs a dictionary, and
+   * the G2P never sees the spelling.
+   */
+  it("treats a page-break hyphen exactly as tokenizeParagraph treats a line break", () => {
+    const merged = mergeAcrossPages([
+      proto("a", 0, ["the", "nation-"]),
+      proto("b", 1, ["state", "is"]),
+    ]);
+    expect(protoText(merged[0])).toBe("the nationstate is");
+
+    // The same word broken over two lines of one paragraph, for comparison.
+    const hyphenated = line([run("nation-", 72, 700)]);
+    const continued = line([run("state", 72, 688)]);
+    const { tokens } = tokenizeParagraph([hyphenated, continued]);
+    expect(tokens.map((t) => t.text)).toEqual(["nationstate"]);
+  });
+
+  /**
+   * `mergeAcrossPages` drops every block it absorbs, so a footnote marker
+   * holding the *index* of its host paragraph pointed at a different paragraph
+   * afterwards — and further out the further into the document you went.
+   */
+  it("lets a merged-away block still be found by the markers lifted out of it", () => {
+    const mergedInto = new Map<string, string>();
+    const merged = mergeAcrossPages(
+      [
+        proto("a", 0, ["opening", "paragraph", "ending", "mid-"]),
+        proto("b", 1, ["sentence", "here."]),
+        proto("c", 1, ["A", "later", "paragraph."]),
+      ],
+      mergedInto,
+    );
+    expect(merged.map((b) => b.id)).toEqual(["a", "c"]);
+    // "b" is gone; anything that was holding it is redirected to "a".
+    expect(mergedInto.get("b")).toBe("a");
+    // The index "c" was recorded under before the merge (2) is now out of
+    // range, which is exactly how markers used to be misfiled.
+    expect(merged[2]).toBeUndefined();
+    expect(merged.findIndex((b) => b.id === "c")).toBe(1);
+  });
+
+  /**
+   * The front page of a JSTOR download is several hundred words about what
+   * JSTOR is and what its terms of use are. It is body-sized and full-width in
+   * the middle of the page, so §4.4's band test cannot see it, and it was read
+   * aloud in full before the first sentence of the paper.
+   */
+  it("keeps a publisher access statement out of the spoken stream", () => {
+    const boilerplate = [
+      "JSTOR is a not-for-profit service that helps scholars, researchers, and students " +
+        "discover, use, and build upon a wide range of content in a trusted digital archive.",
+      "Your use of the JSTOR archive indicates your acceptance of the Terms & Conditions " +
+        "of Use, available at https://about.jstor.org/terms",
+      "Springer Nature is collaborating with JSTOR to digitize, preserve and extend access to Minerva",
+      "This content downloaded from 23.122.250.192 on Wed, 09 Sep 2026 13:22:57 UTC",
+      "All use subject to https://about.jstor.org/terms",
+    ];
+    for (const text of boilerplate) expect(isPublisherBoilerplate(text)).toBe(true);
+    // Furniture is visible in the reflow view and never spoken.
+    expect(isSpoken("runningHead")).toBe(false);
+  });
+
+  it("does not suppress a paper that happens to be about archives or terms", () => {
+    for (const text of [
+      "The terms of use to which a reader consents are rarely read, and archives know it.",
+      "Digital archives preserve scholarship; JSTOR and its peers are the obvious example.",
+      "We shall also have to choose among the different institutions that receive support.",
+      "Not-for-profit laboratories compete with industry for the same scarce researchers.",
+    ]) {
+      expect(isPublisherBoilerplate(text)).toBe(false);
     }
   });
 });
