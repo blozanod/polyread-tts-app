@@ -67,16 +67,22 @@ Those are the published sizes, not estimates. Note that the quantized files are
 not ordered the way the names suggest — `q4` is nearly twice `q4f16` and larger
 than `fp16`, because only some of the graph is quantized in each.
 
-The middle column is the one that decides whether the GPU is used at all: an
-`f16` file on a GPU whose driver does not expose 16-bit shader arithmetic falls
-back to the CPU, which is several times slower. Settings → Benchmark says which
-your GPU is; "If something goes wrong" below has the details.
+The middle column is the one that decides whether a *given* GPU can run a given
+file: a driver that does not expose 16-bit shader arithmetic cannot run an `f16`
+model at all. It is no longer the column that decides whether the GPU is used,
+though, because `--gpu-fallback` fetches an `fp32` copy alongside whatever you
+chose and PolyRead loads that on the GPU rather than moving to the CPU:
 
 ```sh
+node scripts/fetch-assets.mjs --gpu-fallback    # + fp32 spare, so the GPU is kept
 node scripts/fetch-assets.mjs --dtype q8f16     # smallest, fastest on CPU
 node scripts/fetch-assets.mjs --voices all      # all 55 voices, +28 MB
 node scripts/fetch-assets.mjs --voices-from-npm # voices from npm, if the Hub is blocked
 ```
+
+On a machine with a GPU that refuses fp16, that costs 310 MB of disk and buys
+back the several-fold difference between GPU and CPU synthesis. Settings →
+Benchmark prints the whole ladder — every device tried, and what each said.
 
 If a dtype name does not match anything the repository has, the script prints
 every model file it found so you can pass one by name.
@@ -140,6 +146,51 @@ offline. Skip it and the app will ask for a model URL on first run.
 
 The builds are unsigned, because signing them costs money. On macOS that means
 right-click → Open the first time; on Windows, "More info" → "Run anyway".
+
+---
+
+## Which processor it runs on
+
+Synthesis on a GPU is several times faster than synthesis on a CPU, and that is
+not a performance detail — it is the difference between rendering that outruns
+playback and rendering that does not, which is the assumption the whole of §7.3
+rests on. So the GPU is not a preference here. It is the design, and the CPU is
+what happens when there is no other answer left.
+
+`src/synthesis/gpu.ts` picks the hardware and builds the device; the ladder in
+`src/synthesis/kokoroEngine.ts` is climbed down in this order, and every rung is
+proven by *running* the graph rather than merely compiling it, because WebGPU
+compiles a shader the first time an operator runs and not before:
+
+1. **Every GPU the machine will hand out**, best first. Adapters are probed at
+   all three request shapes and ranked: discrete before integrated, NVIDIA first
+   among discrete, anything that can run the model before anything that cannot.
+   Software rasterizers (SwiftShader, lavapipe, WARP) are dropped rather than
+   ranked — they are the CPU with extra steps, and slower at this model than the
+   CPU backend is.
+2. **The best GPU with graph fusions off.** ORT's WebGPU shader generation is
+   thinnest around its fused kernels; a driver that refuses one will usually run
+   the same graph unfused, and that is still a GPU.
+3. **A model file a GPU is known to accept**, if `--gpu-fallback` fetched one.
+   An fp16 model is the fastest thing a GPU can run and the one thing some
+   drivers will not run at all, and the remedy for that is a different file, not
+   a different processor.
+4. **The CPU** — and reaching it is never silent. It raises a card on the
+   library page that names the GPU, the reason, and the one command that would
+   have kept it on the GPU.
+
+Two things make step 1 work that did not before. The device is **created here**,
+with `shader-f16` required and the adapter's own limits rather than the spec's
+256 MB defaults, and handed to the session as the WebGPU provider's `device`
+option — which is the only path `onnxruntime-web` honours, and why the previous
+`env.webgpu.adapter` assignment had no effect at all. And in the desktop build
+`electron/main.ts` forces Chromium onto the discrete GPU before its GPU process
+starts, since the renderer can only rank adapters Chromium already initialized.
+
+Settings → Compute chooses between **GPU first** (the default: the ladder above),
+**GPU only** (the same ladder with step 4 removed, so a machine that cannot use
+its GPU says so instead of quietly running ten times slower) and **CPU**.
+Settings → Benchmark prints the whole ladder, rung by rung, with what each said.
 
 ---
 
@@ -333,36 +384,53 @@ cross-origin isolated, which is the case they work in, and it notices a stall
 and retries on a single thread anyway. If you raised the thread count in
 Settings by hand, put it back.
 
-**It is slow.** Check Settings → Benchmark for which device it picked. WebGPU is
-several times faster than the CPU backend; if it says `wasm`, your browser
-either lacks WebGPU, refused it, or could not run this model on it — the last of
-those shows up as a note beside the import saying so. Failing that, `--dtype q8`
-is the fastest model on CPU.
+**It is slow.** Check Settings → Benchmark for which device it picked, and for
+the ladder underneath it — every rung tried, in order, with what each one said.
+WebGPU is several times faster than the CPU backend, and reaching the CPU means
+every GPU configuration on the machine was refused; the note beside the import
+says which and why. Set Compute to **GPU only** if you would rather have an
+error than a silent tenfold slowdown.
 
-**`ShaderModule with 'Clip' label is invalid`, and it fell back to the CPU.**
-Clip has nothing to do with it. ONNX Runtime emits WGSL's `enable f16;` only
-when the GPU device reports the `shader-f16` feature, and then generates `f16`
-code for an fp16 model regardless — so on a GPU without 16-bit shader support
-*every* shader it compiles is invalid, and the error names whichever one was
-compiled first.
+**`ShaderModule with 'Clip' label is invalid`.** Clip has nothing to do with it.
+ONNX Runtime emits WGSL's `enable f16;` only when the *device* reports the
+`shader-f16` feature, and then generates `f16` code for an fp16 model
+regardless — so on a device without 16-bit shader support *every* shader it
+compiles is invalid, and the error names whichever one was compiled first.
 
-The default model is fp16, so this is the combination to avoid. Either of the
-other two runs on any WebGPU device:
+Note "device", not "GPU". This used to be reported alongside an adapter that
+*did* have `shader-f16`, which looked like a contradiction and was not: they
+were two different pieces of hardware. `onnxruntime-web`'s WebGPU build reads
+`env.webgpu.adapter`, type-checks it and then discards it — Dawn goes and asks
+`navigator.gpu` for its own adapter and builds its own device with its own
+feature set. So the adapter PolyRead chose was reported and the adapter Dawn
+chose ran the model.
+
+PolyRead now creates the `GPUDevice` itself — with `shader-f16` required and the
+adapter's real limits rather than the spec's 256 MB default, which is the other
+half of that error message — and passes it to the session as the WebGPU
+provider's `device` option, which is the one path ONNX Runtime honours. If a
+device genuinely cannot do 16-bit arithmetic, the remedy is a model file rather
+than a GPU:
 
 ```sh
-npm run assets -- --dtype q8      # 88 MB, and the fastest on CPU too
-npm run assets -- --dtype fp32    # 310 MB, best quality
+npm run assets -- --gpu-fallback  # fp32 spare, loaded on the GPU automatically
 ```
 
-Settings → Benchmark names the adapter and says whether it has 16-bit shaders,
-so you can check before downloading anything.
-
 **It picked the wrong GPU.** On a laptop with an integrated and a discrete GPU,
-`navigator.gpu.requestAdapter()` with no options — which is what ONNX Runtime
-asks for — usually returns the integrated one. PolyRead requests both power
-preferences itself and takes the discrete GPU, unless only the integrated one
-has 16-bit shader support, in which case being able to run the model wins over
-being faster at it. Settings → Benchmark says which it took.
+`navigator.gpu.requestAdapter()` with no options returns the integrated one.
+PolyRead probes all three request shapes, ranks what comes back — discrete
+before integrated, NVIDIA first among discrete, anything that can run the model
+before anything that cannot, software rasterizers not at all — and creates the
+device on the winner. Settings → Benchmark names it and says how it was
+classified.
+
+The desktop build goes a step further, because the renderer can only rank the
+adapters Chromium initialized: `electron/main.ts` starts the browser process
+with `force_high_performance_gpu`, `ignore-gpu-blocklist`, `enable-unsafe-webgpu`
+and Dawn's `allow_unsafe_apis`, adds `Vulkan` on Linux, and exports NVIDIA's
+three PRIME offload variables where an NVIDIA driver is loaded. `POLYREAD_GPU=off`
+turns all of it off and runs on the CPU, for a machine whose driver is the
+problem.
 
 **A word is mispronounced.** Proper nouns route through eSpeak's letter-to-sound
 rules — Przeworski and Tocqueville come out about as well as you would expect.

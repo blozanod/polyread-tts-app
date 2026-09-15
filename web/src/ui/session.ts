@@ -272,7 +272,7 @@ export class Session {
         message: text,
         detail:
           "This is usually the model being too large for the memory available. " +
-          "A smaller one — npm run assets -- --dtype q8 — should get past it.",
+          "A smaller one — npm run assets -- --dtype q8f16 — should get past it.",
       },
     });
   }
@@ -424,10 +424,13 @@ export class Session {
         // and playback still resumes when it lands. It belongs in the notes
         // beside the import, not under a "something went wrong" heading over a
         // reader that is working.
-        if (event.kind === "deviceFallback") {
+        // A move from one GPU configuration to another is the ladder working:
+        // it belongs in the import notes and nowhere else. Only landing on the
+        // CPU raises the banner, because only that changes what the app is.
+        if (event.kind === "deviceFallback" || event.kind === "deviceChange") {
           if (!this.engineNotes.includes(event.message)) this.engineNotes.push(event.message);
           this.patch({
-            deviceNotice: event.message,
+            deviceNotice: event.kind === "deviceFallback" ? event.message : this.state.deviceNotice,
             diagnostics: [...this.engineNotes, ...(this.state.document?.diagnostics ?? [])],
           });
           break;

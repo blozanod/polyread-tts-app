@@ -165,12 +165,20 @@ export function SettingsSheet({
                 value={settings.device}
                 onChange={(value) => set("device", value)}
                 options={[
-                  { value: "auto", label: "Auto" },
-                  { value: "webgpu", label: "WebGPU" },
+                  { value: "auto", label: "GPU first" },
+                  { value: "webgpu", label: "GPU only" },
                   { value: "wasm", label: "CPU" },
                 ]}
               />
             </label>
+            <p className="hint">
+              <strong>GPU first</strong> tries every GPU this machine has — the discrete one before
+              the integrated one — then the same GPU with graph fusions off, then a GPU-compatible
+              model file if one has been fetched, and only then the CPU.{" "}
+              <strong>GPU only</strong> does all of that and reports a failure instead of taking the
+              last step, which is how you find out that a machine is silently synthesizing ten times
+              slower than it should.
+            </p>
             <label className="field">
               <span>CPU threads</span>
               <input
@@ -266,17 +274,23 @@ export function SettingsSheet({
 
             {state.engine && (
               <p className="storage-line">
-                {state.engine.device} · timings{" "}
+                {state.engine.deviceDetail} · timings{" "}
                 {state.engine.timingSource === "model" ? "exact" : "estimated"}
               </p>
             )}
             {state.engine?.adapter && (
               <p className="storage-line">
-                GPU: {state.engine.adapter.description} ·{" "}
+                GPU: {state.engine.adapter.description} ({state.engine.adapter.klass}) ·{" "}
                 {state.engine.adapter.shaderF16
-                  ? "16-bit shaders supported"
+                  ? "16-bit shaders enabled"
                   : "no 16-bit shaders — fp16 models cannot run on it"}
               </p>
+            )}
+            {state.engine && state.engine.attempts.length > 1 && (
+              // Worth showing whenever more than one rung was needed: it is the
+              // difference between "the GPU was not used" and "these four
+              // things were tried and here is what each said".
+              <pre className="report">{state.engine.attempts.join("\n")}</pre>
             )}
             {state.benchmark && <pre className="report">{state.benchmark}</pre>}
           </details>

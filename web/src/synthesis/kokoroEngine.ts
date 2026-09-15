@@ -11,7 +11,10 @@ import {
   estimateChunkFrames,
   snapBoundariesToEnergy,
 } from "./durationEstimator";
+import { acquireDevice, probeAdapters, type AdapterReport, type GpuCandidate } from "./gpu";
 import { loadVoice, type Voice } from "./voices";
+
+export type { AdapterReport, GpuClass } from "./gpu";
 
 /**
  * §7.1's model interface, in one place.
@@ -58,97 +61,6 @@ export function defaultThreadCount(cores: number, isolated = isCrossOriginIsolat
   return Math.max(1, Math.min(4, cores - 1));
 }
 
-/**
- * The parts of the WebGPU API this file uses, declared locally.
- *
- * `@webgpu/types` is not a dependency and `lib.dom` does not carry these yet,
- * and the alternative — `any` at every call site — is how the adapter got
- * picked by accident in the first place.
- */
-interface GpuAdapterLike {
-  features: { has(feature: string): boolean };
-  info?: { vendor?: string; architecture?: string; device?: string; description?: string };
-  requestAdapterInfo?: () => Promise<GpuAdapterLike["info"]>;
-}
-
-interface GpuLike {
-  requestAdapter(options?: { powerPreference?: "high-performance" | "low-power" }): Promise<GpuAdapterLike | null>;
-}
-
-/** What the chosen adapter is, and what it can do. Reported in Settings. */
-export interface AdapterReport {
-  /** Vendor and device as the browser describes them. */
-  description: string;
-  /**
-   * Whether the driver exposes 16-bit shader arithmetic.
-   *
-   * This decides whether an fp16 model can run on the GPU at all. ONNX Runtime
-   * emits `enable f16;` only when the device has `shader-f16`, and then
-   * generates `f16` WGSL for an fp16 model regardless — so without the feature
-   * every shader it compiles is invalid, and the first one to be compiled is
-   * the one named in the error. That is what
-   * `ShaderModule with 'Clip' label is invalid` means: not a problem with Clip.
-   */
-  shaderF16: boolean;
-  powerPreference: "high-performance" | "low-power";
-  /** True when the two power preferences resolved to different hardware. */
-  hadChoice: boolean;
-}
-
-/**
- * Picks the GPU, rather than letting the default pick it.
- *
- * ONNX Runtime asks for `navigator.gpu.requestAdapter()` with no options, and
- * on a laptop with both an integrated and a discrete GPU the browser's answer
- * to that is usually the integrated one — so PolyRead was running Kokoro on an
- * Iris Xe while an RTX sat idle, which is most of the difference between
- * faster than realtime and not.
- *
- * `shader-f16` outranks raw speed here because it is the difference between the
- * GPU running the model and not running it at all.
- */
-export async function selectAdapter(
-  gpu: GpuLike | undefined,
-): Promise<{ adapter: GpuAdapterLike; report: AdapterReport } | undefined> {
-  if (!gpu?.requestAdapter) return undefined;
-
-  const candidates: Array<{ adapter: GpuAdapterLike; powerPreference: "high-performance" | "low-power" }> = [];
-  for (const powerPreference of ["high-performance", "low-power"] as const) {
-    try {
-      const adapter = await gpu.requestAdapter({ powerPreference });
-      if (adapter) candidates.push({ adapter, powerPreference });
-    } catch {
-      // An adapter that cannot be requested is one fewer candidate, not a failure.
-    }
-  }
-  if (candidates.length === 0) return undefined;
-
-  const scored = candidates.map((candidate) => ({
-    ...candidate,
-    shaderF16: candidate.adapter.features.has("shader-f16"),
-  }));
-  scored.sort((a, b) => {
-    if (a.shaderF16 !== b.shaderF16) return a.shaderF16 ? -1 : 1;
-    return a.powerPreference === "high-performance" ? -1 : 1;
-  });
-
-  const best = scored[0];
-  const info = best.adapter.info ?? (await best.adapter.requestAdapterInfo?.().catch(() => undefined));
-  const described = [info?.vendor, info?.architecture, info?.device, info?.description]
-    .filter((part) => typeof part === "string" && part.length > 0)
-    .join(" ");
-
-  return {
-    adapter: best.adapter,
-    report: {
-      description: described || "unnamed adapter",
-      shaderF16: best.shaderF16,
-      powerPreference: best.powerPreference,
-      hadChoice: scored.length > 1 && scored[0].shaderF16 !== scored[1].shaderF16,
-    },
-  };
-}
-
 function configureRuntime(threads?: number): void {
   const cores = typeof navigator !== "undefined" ? (navigator.hardwareConcurrency ?? 2) : 2;
   ort.env.wasm.numThreads = Math.max(1, Math.min(threads ?? defaultThreadCount(cores), cores));
@@ -172,10 +84,29 @@ export interface KokoroEngineConfig {
    * §7.2's Phase A as specified and the estimated tier.
    */
   durationModelUrl?: string;
+  /**
+   * A model the GPU is known to be able to run, tried *before* the CPU.
+   *
+   * The default model is fp16, which is the fastest thing a GPU can run and the
+   * one thing some drivers will not run at all. When that happens the remedy is
+   * a different file, not a different device — so if one is sitting next to the
+   * first (`npm run assets -- --gpu-fallback` puts it there), the ladder loads
+   * it on the GPU rather than moving the whole engine to the CPU. A 404 here is
+   * not an error: it is simply one fewer rung.
+   */
+  gpuFallbackModelUrl?: string;
   /** Directory holding `<voice>.bin`. */
   voicesBaseUrl: string;
   voiceID: string;
-  /** "auto" tries WebGPU and falls back to WASM. */
+  /**
+   * Which processor synthesis is allowed to use.
+   *
+   * - `"auto"` — every GPU this machine has, in the order most likely to work,
+   *   and only then the CPU. The default.
+   * - `"webgpu"` — the GPU or nothing. A machine that cannot run the model on a
+   *   GPU reports that instead of quietly running ten times slower.
+   * - `"wasm"` — the CPU, by choice.
+   */
   device?: "auto" | "webgpu" | "wasm";
   /** WASM thread count. Omitted means four, or the core count if lower. */
   threads?: number;
@@ -195,9 +126,12 @@ export interface LoadHooks {
    */
   beforeCompile?: () => Promise<void>;
   /**
-   * Called when a provider compiled the graph but could not run it, before the
-   * next one is tried. Falling from WebGPU to WASM is roughly a tenfold
-   * slowdown, which is worth saying out loud rather than discovering.
+   * Called when one rung of the ladder was refused, before the next is tried.
+   *
+   * Most of these are not worth reporting on their own — a driver refusing one
+   * of four GPU configurations is a detail — but the last one before the CPU
+   * is, because falling from a GPU to WASM is roughly a tenfold slowdown and
+   * worth saying out loud rather than discovering.
    */
   onProviderRejected?: (provider: string, reason: string) => void;
 }
@@ -210,11 +144,16 @@ interface SessionIO {
 }
 
 export interface EngineInfo {
+  /** `"webgpu"` or `"wasm"`, as ONNX Runtime names them. */
   device: string;
+  /** The same thing in words: which GPU, at which precision, or why not. */
+  deviceDetail: string;
   timingSource: ChunkTiming["source"];
   modelInterface: string;
   voiceID: string;
   adapter?: AdapterReport;
+  /** Every rung tried, in order, and what became of it. For Settings. */
+  attempts: string[];
 }
 
 export class KokoroEngine {
@@ -228,15 +167,39 @@ export class KokoroEngine {
   private readonly vocabulary: KokoroVocabulary;
   private readonly weights: DurationWeights;
   private readonly config: KokoroEngineConfig;
-  /** Set once the GPU has been abandoned, so the rebuild is attempted once. */
-  private cpuFallback: Promise<boolean> | undefined;
+  /**
+   * Every way of running this model that is still untried, in order, and where
+   * in it we currently are.
+   *
+   * A run failure moves down the ladder rather than straight to the CPU: the
+   * next GPU, the same GPU with the graph fusions the driver choked on turned
+   * off, a model file the GPU is known to accept — and the CPU only once all
+   * of that is exhausted.
+   */
+  private plan: readonly Attempt[];
+  private planIndex: number;
+  /** In-flight rebuild, so a burst of failed chunks does not start four of them. */
+  private recovery: Promise<boolean> | undefined;
+  /** Set by the device's `lost` promise; the next run rebuilds before trying. */
+  private deviceLost: string | undefined;
+  private gpuDevice: GPUDevice | undefined;
   readonly adapter: AdapterReport | undefined;
   readonly calibration = new Calibration();
+  /** Every rung tried so far, in order, and what became of it. */
+  readonly attempts: string[];
   device: string;
+  /** Which GPU, at which precision — or why not. */
+  deviceDetail: string;
   /** Set when a chunk's rendered length disagreed with the duration model. */
   frameCountMismatches = 0;
-  /** Called when a run failure forced the engine onto a different device. */
-  onDeviceChange: ((device: string, reason: string) => void) | undefined;
+  /**
+   * Called when a run failure moved the engine down the ladder.
+   *
+   * `detail` is the new rung as `deviceDetail` spells it — which GPU, at which
+   * precision — so a caller can say "moved to the integrated GPU" rather than
+   * the much less useful "moved to webgpu".
+   */
+  onDeviceChange: ((detail: string, reason: string) => void) | undefined;
 
   private constructor(init: {
     model: ort.InferenceSession;
@@ -248,8 +211,13 @@ export class KokoroEngine {
     voice: Voice;
     vocabulary: KokoroVocabulary;
     device: string;
+    deviceDetail: string;
     config: KokoroEngineConfig;
     adapter?: AdapterReport;
+    gpuDevice?: GPUDevice;
+    plan: readonly Attempt[];
+    planIndex: number;
+    attempts: string[];
   }) {
     this.model = init.model;
     this.modelIO = init.modelIO;
@@ -261,10 +229,25 @@ export class KokoroEngine {
     this.vocabulary = init.vocabulary;
     this.weights = new DurationWeights(init.vocabulary);
     this.device = init.device;
+    this.deviceDetail = init.deviceDetail;
     this.config = init.config;
     this.adapter = init.adapter;
+    this.gpuDevice = init.gpuDevice;
+    this.plan = init.plan;
+    this.planIndex = init.planIndex;
+    this.attempts = init.attempts;
   }
 
+  /**
+   * Loads the voice model onto the best thing that will actually run it.
+   *
+   * The order is fixed and it is the point of this class: every GPU this
+   * machine will hand out, then the best of them with the graph fusions a
+   * driver may have choked on turned off, then a model file a GPU is known to
+   * accept — and the CPU only when all of that has been refused. Each rung is
+   * proven by running the graph, not merely by compiling it, because WebGPU
+   * compiles a shader the first time an operator runs and not before.
+   */
   static async load(
     config: KokoroEngineConfig,
     vocabulary: KokoroVocabulary,
@@ -283,33 +266,19 @@ export class KokoroEngine {
 
     await beforeCompile?.();
 
-    // Picked here rather than at the top of the load: ONNX Runtime reads this
-    // when it creates the session, and an adapter handed over minutes earlier —
-    // across a few hundred megabytes of download — may have gone stale by then.
-    let adapter: AdapterReport | undefined;
-    if ((config.device ?? "auto") !== "wasm") {
-      const gpu = (globalThis.navigator as { gpu?: GpuLike } | undefined)?.gpu;
-      const chosen = await selectAdapter(gpu);
-      if (chosen) {
-        adapter = chosen.report;
-        const webgpu = ort.env.webgpu as { adapter?: unknown; powerPreference?: string };
-        webgpu.adapter = chosen.adapter;
-        // Honoured by builds that ignore `adapter`; harmless where it is not.
-        webgpu.powerPreference = chosen.report.powerPreference;
-      }
-    }
+    // Probed here rather than at the top of the load: an adapter handed over
+    // minutes earlier — across a few hundred megabytes of download — may have
+    // gone stale, and on a laptop the answer can change while the download
+    // runs.
+    const plan = planAttempts(config, await probeAdapters(gpuOf()));
 
     // Compiling a few hundred megabytes of graph is the longest stretch of the
     // load with nothing to report, so it gets its own label.
     onProgress?.(COMPILE_LABEL, 0, 1);
-    const main = await createWaveformSession(
-      modelBytes,
-      providersFor(config.device),
-      config,
-      vocabulary,
-      voice,
-      (provider, reason) => onProviderRejected?.(provider, explainRejection(provider, reason, adapter)),
-    );
+
+    const context = attemptContext(config, vocabulary, voice, modelBytes);
+    const walked = await walkPlan(plan, 0, context, onProviderRejected);
+    const main = walked.live;
 
     // The duration subgraph runs once per chunk and shares the acoustic model's
     // device. It used to be pinned to WASM on the grounds that it is small and
@@ -317,10 +286,10 @@ export class KokoroEngine {
     // and single-threaded WASM turned §7.2 into several minutes of loading bar
     // on a machine whose GPU does the same pass in milliseconds.
     const duration = durationBytes
-      ? await createDurationSession(durationBytes, main.device, config, vocabulary, voice)
+      ? await createDurationSession(durationBytes, main, config, vocabulary, voice)
       : undefined;
 
-    return new KokoroEngine({
+    const engine = new KokoroEngine({
       model: main.session,
       modelIO: main.io,
       waveformOutput: main.output,
@@ -329,10 +298,17 @@ export class KokoroEngine {
       durationOutput: duration?.output,
       voice,
       vocabulary,
-      device: main.device,
+      device: main.provider,
+      deviceDetail: main.detail,
       config,
-      adapter,
+      adapter: main.adapter,
+      gpuDevice: main.gpuDevice,
+      plan,
+      planIndex: walked.index,
+      attempts: walked.log,
     });
+    main.onLost = (message) => engine.noteDeviceLost(message);
+    return engine;
   }
 
   get timingSource(): ChunkTiming["source"] {
@@ -342,11 +318,25 @@ export class KokoroEngine {
   get info(): EngineInfo {
     return {
       device: this.device,
+      deviceDetail: this.deviceDetail,
       timingSource: this.timingSource,
       modelInterface: this.describeInterfaces(),
       voiceID: this.voice.name,
       adapter: this.adapter,
+      attempts: [...this.attempts],
     };
+  }
+
+  /**
+   * Called from the device's `lost` promise and its uncaptured-error handler.
+   *
+   * A lost device does not fail the next run cleanly — it fails every one of
+   * them — so the flag is checked before running rather than after, and the
+   * engine moves down the ladder on its own.
+   */
+  private noteDeviceLost(message: string): void {
+    if (this.device !== "webgpu") return;
+    this.deviceLost ??= message;
   }
 
   describeInterfaces(): string {
@@ -456,7 +446,7 @@ export class KokoroEngine {
   }
 
   /**
-   * One inference, with the GPU escape hatch.
+   * One inference, with the ladder underneath it.
    *
    * A WebGPU session that *creates* successfully can still fail on every run:
    * the shaders for individual operators are compiled lazily, per op and dtype,
@@ -466,8 +456,12 @@ export class KokoroEngine {
    * a pipeline that only fails at some shapes would slip past it — and the way
    * that used to present was the worst available: Phase B died on its first
    * chunk, the transport sat on "rendering this passage" forever, and the
-   * benchmark screen would not run at all. So a run failure on the GPU rebuilds
-   * the session on the CPU and retries, once.
+   * benchmark screen would not run at all.
+   *
+   * So a run failure descends one rung and retries. What it does *not* do any
+   * more is jump straight to the CPU: another GPU, the same GPU without the
+   * fused kernel it disliked, and a model file a GPU will accept all come
+   * first.
    */
   private async run(
     which: "waveform" | "duration",
@@ -479,6 +473,14 @@ export class KokoroEngine {
         ? { session: this.durationModel, io: this.durationIO }
         : { session: this.model, io: this.modelIO };
 
+    // A device reported lost fails every run on it, so rebuild before trying
+    // rather than after failing.
+    if (this.deviceLost !== undefined && which === "waveform") {
+      const reason = this.deviceLost;
+      this.deviceLost = undefined;
+      await this.descend(reason);
+    }
+
     const first = session();
     try {
       return await first.session.run(buildFeeds(tokens, this.voice.style(phonemeCount), first.io));
@@ -487,44 +489,48 @@ export class KokoroEngine {
       // subgraph that will not run is §7.2's exact tier going away, which the
       // coordinator already treats as a downgrade to the estimate.
       if (which !== "waveform") throw error;
-      if (!(await this.fallBackToCpu(error))) throw error;
+      const reason = error instanceof Error ? error.message : String(error);
+      if (!(await this.descend(reason))) throw error;
       const retry = session();
       return await retry.session.run(buildFeeds(tokens, this.voice.style(phonemeCount), retry.io));
     }
   }
 
   /**
-   * Rebuilds both sessions on the WASM backend after a GPU run failed. Returns
-   * false when there is nothing left to fall back to, in which case the caller
-   * rethrows the original error.
+   * Rebuilds both sessions on the next rung of the ladder.
+   *
+   * Returns false when there is no next rung, in which case the caller rethrows
+   * the original error. One rebuild runs at a time: a Phase B that fails four
+   * chunks in a row before the first rebuild lands would otherwise start four
+   * of them and fetch the model four times.
    */
-  private fallBackToCpu(error: unknown): Promise<boolean> {
-    if (this.device === "wasm") return Promise.resolve(false);
-    if (this.cpuFallback) return this.cpuFallback;
+  private descend(reason: string): Promise<boolean> {
+    if (this.recovery) return this.recovery;
+    if (this.planIndex + 1 >= this.plan.length) return Promise.resolve(false);
 
-    const reason = error instanceof Error ? error.message : String(error);
-    this.cpuFallback = (async () => {
-      const previous = { model: this.model, duration: this.durationModel };
+    const rebuild = (async () => {
+      const previous = { model: this.model, duration: this.durationModel, gpu: this.gpuDevice };
       try {
-        const modelBytes = await fetchModel(this.config.modelUrl, "Kokoro model");
-        const main = await createWaveformSession(
-          modelBytes,
-          [["wasm"]],
-          this.config,
-          this.vocabulary,
-          this.voice,
-        );
+        const context = attemptContext(this.config, this.vocabulary, this.voice);
+        const walked = await walkPlan(this.plan, this.planIndex + 1, context);
+        const main = walked.live;
+
         this.model = main.session;
         this.modelIO = main.io;
         this.waveformOutput = main.output;
-        this.device = main.device;
+        this.device = main.provider;
+        this.deviceDetail = main.detail;
+        this.gpuDevice = main.gpuDevice;
+        this.planIndex = walked.index;
+        this.attempts.push(...walked.log);
+        main.onLost = (message) => this.noteDeviceLost(message);
 
         if (this.config.durationModelUrl && this.durationModel) {
           const durationBytes = await fetchModel(this.config.durationModelUrl, "Duration model").catch(
             () => undefined,
           );
           const duration = durationBytes
-            ? await createDurationSession(durationBytes, "wasm", this.config, this.vocabulary, this.voice)
+            ? await createDurationSession(durationBytes, main, this.config, this.vocabulary, this.voice)
             : undefined;
           this.durationModel = duration?.session;
           this.durationIO = duration?.io;
@@ -533,20 +539,37 @@ export class KokoroEngine {
       } catch {
         return false;
       }
+
       await previous.model.release?.().catch(() => undefined);
       if (previous.duration !== this.durationModel) {
         await previous.duration?.release?.().catch(() => undefined);
       }
-      this.onDeviceChange?.(this.device, reason);
+      // Destroying the old device returns its VRAM now rather than at the next
+      // garbage collection, which matters when the reason for descending was
+      // that the GPU ran out of it.
+      if (previous.gpu && previous.gpu !== this.gpuDevice) previous.gpu.destroy?.();
+
+      this.onDeviceChange?.(this.deviceDetail, reason);
       return true;
     })();
 
-    return this.cpuFallback;
+    // Cleared only once the rebuild has finished swapping the sessions in, not
+    // partway through it: a chunk that failed while the old session was still
+    // being released would otherwise start a second rebuild on top of the first.
+    this.recovery = rebuild.finally(() => {
+      this.recovery = undefined;
+    });
+    return this.recovery;
   }
 
   async dispose(): Promise<void> {
     await this.model.release?.();
     await this.durationModel?.release?.();
+    // The sessions hold the device; releasing them without destroying it leaves
+    // the GPU allocation alive until collection, and a reader reopened a few
+    // times would accumulate them.
+    this.gpuDevice?.destroy?.();
+    this.gpuDevice = undefined;
   }
 
   /** For the benchmark screen; exposed so §0.1's measurement has something to call. */
@@ -636,14 +659,100 @@ function distributeSegment(frames: readonly number[], target: number): number[] 
 // MARK: - Session plumbing
 
 /**
- * Turns a provider's rejection into something that names the cause.
+ * One way of running the model: which provider, which GPU, which model file.
+ *
+ * The ladder is a list of these. Each is a complete, self-contained answer to
+ * "how should this run" — nothing about a rung depends on the one before it —
+ * so descending after a failure is just moving an index.
+ */
+export interface Attempt {
+  provider: "webgpu" | "wasm";
+  /** How this rung reads in Settings and in the log. */
+  label: string;
+  /** Absent on the CPU rung. */
+  candidate?: GpuCandidate;
+  /**
+   * `"all"` is the fast path. `"disabled"` exists because ORT's fusions are
+   * where its WebGPU shader generation is thinnest: a driver that refuses one
+   * fused kernel — the reported `ShaderModule with 'Clip' label is invalid` is
+   * one — will usually run the same graph unfused, which is still a GPU and
+   * still several times a CPU.
+   */
+  optimization: "all" | "disabled";
+  /** Which model file this rung loads. */
+  model: "primary" | "gpuFallback";
+}
+
+/** `navigator.gpu`, where there is one. Workers have it; Node does not. */
+function gpuOf(): GPU | undefined {
+  return (globalThis.navigator as { gpu?: GPU } | undefined)?.gpu;
+}
+
+function describeCandidate(candidate: GpuCandidate): string {
+  const { report } = candidate;
+  const klass = report.klass === "unknown" ? "" : `${report.klass}, `;
+  return `${report.description} (${klass}${report.powerPreference})`;
+}
+
+/**
+ * The ladder, in the order it is climbed down.
+ *
+ * Every GPU first, best first; then the best GPU with fusions off; then a model
+ * file a GPU is known to accept; and the CPU last, and only if it is allowed at
+ * all. `device: "webgpu"` removes the CPU rung entirely, which is the
+ * difference between "prefer the GPU" and "the GPU or tell me why not".
+ */
+export function planAttempts(config: KokoroEngineConfig, candidates: readonly GpuCandidate[]): Attempt[] {
+  const wanted = config.device ?? "auto";
+  const attempts: Attempt[] = [];
+
+  if (wanted !== "wasm") {
+    for (const candidate of candidates) {
+      attempts.push({
+        provider: "webgpu",
+        candidate,
+        optimization: "all",
+        model: "primary",
+        label: `GPU — ${describeCandidate(candidate)}`,
+      });
+    }
+    const best = candidates[0];
+    if (best) {
+      attempts.push({
+        provider: "webgpu",
+        candidate: best,
+        optimization: "disabled",
+        model: "primary",
+        label: `GPU — ${describeCandidate(best)}, graph fusions off`,
+      });
+      if (config.gpuFallbackModelUrl) {
+        attempts.push({
+          provider: "webgpu",
+          candidate: best,
+          optimization: "all",
+          model: "gpuFallback",
+          label: `GPU — ${describeCandidate(best)}, GPU-compatible model`,
+        });
+      }
+    }
+  }
+
+  if (wanted !== "webgpu") {
+    attempts.push({ provider: "wasm", optimization: "all", model: "primary", label: "CPU" });
+  }
+  return attempts;
+}
+
+/**
+ * Turns a rejection into something that names the cause.
  *
  * `Failed to create a WebGPU compute pipeline: ShaderModule with 'Clip' label
  * is invalid` is a true statement about a shader and a useless one about the
- * problem. When the chosen adapter has no `shader-f16`, the cause is that the
- * model is float16 and the driver cannot do 16-bit shader arithmetic — every
- * shader would have failed, and Clip is simply the first one compiled. That has
- * a fix, and the fix is a different model file rather than a different GPU.
+ * problem. When the device running the model has no `shader-f16`, the cause is
+ * that the model is float16 and the driver cannot do 16-bit shader arithmetic —
+ * every shader would have failed, and Clip is simply the first one compiled.
+ * That has a fix, and the fix is a different model file rather than a different
+ * GPU.
  */
 export function explainRejection(
   provider: string,
@@ -654,36 +763,75 @@ export function explainRejection(
   if (!adapter) return `webgpu: ${reason}`;
   if (!adapter.shaderF16) {
     return (
-      `The GPU (${adapter.description}) does not support 16-bit shader arithmetic, ` +
-      "so it cannot run an fp16 model — which is the default one. " +
-      'Re-fetch a model it can run with "npm run assets -- --dtype q8" (88 MB) or ' +
-      '"npm run assets -- --dtype fp32" (310 MB), and the GPU will be used. ' +
-      `Until then synthesis runs on the CPU. The underlying error was: ${reason}`
+      `${adapter.description} cannot do 16-bit shader arithmetic, so it cannot run an fp16 model — ` +
+      "which is the default one. Keep it on the GPU with " +
+      '"npm run assets -- --gpu-fallback", which fetches an fp32 copy (310 MB) ' +
+      "and leaves it where the engine will find it. " +
+      `The underlying error was: ${reason}`
     );
   }
-  return (
-    `The GPU (${adapter.description}) reports 16-bit shader support but still refused the model, ` +
-    `so synthesis runs on the CPU: ${reason}`
-  );
+  return `${adapter.description} refused the model: ${reason}`;
 }
 
-function providersFor(device: KokoroEngineConfig["device"]): ort.InferenceSession.ExecutionProviderConfig[][] {
-  const wanted = device ?? "auto";
-  if (wanted === "wasm") return [["wasm"]];
-  if (wanted === "webgpu") return [["webgpu"]];
-  return [["webgpu"], ["wasm"]];
-}
-
-interface ResolvedSession {
+/** What one rung produced, once it was proven by an actual inference. */
+interface LiveSession {
   session: ort.InferenceSession;
   io: SessionIO;
   output: string;
-  device: string;
+  provider: "webgpu" | "wasm";
+  /** Which GPU, at which precision — or why not. Shown in Settings. */
+  detail: string;
+  adapter?: AdapterReport;
+  gpuDevice?: GPUDevice;
+  /**
+   * Reassigned by the engine once it exists, so a device lost after the load
+   * reaches the thing that can rebuild on it.
+   */
+  onLost?: (message: string) => void;
 }
 
 /**
- * Creates the acoustic session on the first provider that both compiles the
- * graph *and* runs it.
+ * Everything a rung needs that is not the rung itself: the model bytes (fetched
+ * once, however many rungs use them), the voice, and the vocabulary the smoke
+ * test encodes with.
+ */
+interface AttemptContext {
+  config: KokoroEngineConfig;
+  vocabulary: KokoroVocabulary;
+  voice: Voice;
+  bytes(which: Attempt["model"]): Promise<Uint8Array | undefined>;
+}
+
+function attemptContext(
+  config: KokoroEngineConfig,
+  vocabulary: KokoroVocabulary,
+  voice: Voice,
+  primary?: Uint8Array,
+): AttemptContext {
+  const cache = new Map<Attempt["model"], Promise<Uint8Array | undefined>>();
+  if (primary) cache.set("primary", Promise.resolve(primary));
+
+  return {
+    config,
+    vocabulary,
+    voice,
+    bytes(which) {
+      const existing = cache.get(which);
+      if (existing) return existing;
+      const url = which === "primary" ? config.modelUrl : config.gpuFallbackModelUrl;
+      // A missing GPU-compatible model is a rung that is not there, not a
+      // failure: most installs will not have fetched one.
+      const fetched = url
+        ? fetchModel(url, which === "primary" ? "Kokoro model" : "GPU model").catch(() => undefined)
+        : Promise.resolve(undefined);
+      cache.set(which, fetched);
+      return fetched;
+    },
+  };
+}
+
+/**
+ * Climbs down the ladder from `from` until something both compiles *and* runs.
  *
  * The second half is the part that was missing. `InferenceSession.create`
  * succeeding means the graph parsed and the weights uploaded; it says nothing
@@ -693,54 +841,143 @@ interface ResolvedSession {
  * `Failed to create a WebGPU compute pipeline: ShaderModule with 'Clip' label
  * is invalid` — after the app had already said "voice ready", so every symptom
  * landed minutes later and somewhere else. One throwaway inference here turns
- * that into a provider that is simply not chosen.
+ * that into a rung that is simply not chosen.
  */
-async function createWaveformSession(
-  bytes: Uint8Array,
-  providers: ort.InferenceSession.ExecutionProviderConfig[][],
-  config: KokoroEngineConfig,
-  vocabulary: KokoroVocabulary,
-  voice: Voice,
+async function walkPlan(
+  plan: readonly Attempt[],
+  from: number,
+  context: AttemptContext,
   onRejected?: (provider: string, reason: string) => void,
-): Promise<ResolvedSession> {
+): Promise<{ live: LiveSession; index: number; log: string[] }> {
+  const log: string[] = [];
   let lastError: unknown;
-  for (const executionProviders of providers) {
-    const name = String(executionProviders[0]);
+  /**
+   * Why the GPU was given up on, held until the CPU rung is actually reached.
+   *
+   * Reporting it from "the last GPU rung" instead would miss the ordinary case:
+   * the last GPU rung is usually the GPU-compatible model file, most installs
+   * have not fetched one, and a rung that is skipped rather than tried throws
+   * nothing to report — so the app would land on the CPU in silence, which is
+   * the one outcome this whole file exists to make impossible to miss.
+   */
+  let gpuGaveUp: string | undefined;
+
+  for (let index = Math.max(0, from); index < plan.length; index++) {
+    const attempt = plan[index];
+    if (attempt.provider === "wasm" && gpuGaveUp) {
+      onRejected?.("webgpu", gpuGaveUp);
+      gpuGaveUp = undefined;
+    }
     let session: ort.InferenceSession | undefined;
+    let acquired: Awaited<ReturnType<typeof acquireDevice>>;
     try {
+      const bytes = await context.bytes(attempt.model);
+      if (!bytes) {
+        log.push(`${attempt.label}: no model file`);
+        continue;
+      }
+
+      // The device is created here, by us, with the features the model needs —
+      // which is the only way to choose either. See `gpu.ts`.
+      if (attempt.provider === "webgpu") {
+        const live: LiveSession = {} as LiveSession;
+        acquired = await acquireDevice(gpuOf(), attempt.candidate!, (message) => live.onLost?.(message));
+        if (!acquired) {
+          log.push(`${attempt.label}: no device`);
+          gpuGaveUp ??= `${attempt.candidate!.report.description} would not give out a device.`;
+          continue;
+        }
+        session = await ort.InferenceSession.create(bytes, {
+          executionProviders: [{ name: "webgpu", device: acquired.device }],
+          graphOptimizationLevel: attempt.optimization,
+        });
+        const io = resolveInputs(session, context.config.modelUrl);
+        const output = resolveOutput(session, WAVEFORM_OUTPUT_NAMES, context.config.modelUrl, "waveform");
+        await smokeTest(session, io, output, context.vocabulary, context.voice);
+
+        Object.assign(live, {
+          session,
+          io,
+          output,
+          provider: "webgpu" as const,
+          detail: `${attempt.label}${acquired.features.length ? ` · ${acquired.features.join(", ")}` : ""}${
+            acquired.maxBufferMB ? ` · ${acquired.maxBufferMB} MB buffers` : ""
+          }`,
+          adapter: acquired.report,
+          gpuDevice: acquired.device,
+        });
+        log.push(`${attempt.label}: running`);
+        return { live, index, log };
+      }
+
       session = await ort.InferenceSession.create(bytes, {
-        executionProviders,
-        graphOptimizationLevel: "all",
+        executionProviders: ["wasm"],
+        graphOptimizationLevel: attempt.optimization,
       });
-      const io = resolveInputs(session, config.modelUrl);
-      const output = resolveOutput(session, WAVEFORM_OUTPUT_NAMES, config.modelUrl, "waveform");
-      await smokeTest(session, io, output, vocabulary, voice);
-      return { session, io, output, device: name };
+      const io = resolveInputs(session, context.config.modelUrl);
+      const output = resolveOutput(session, WAVEFORM_OUTPUT_NAMES, context.config.modelUrl, "waveform");
+      await smokeTest(session, io, output, context.vocabulary, context.voice);
+      log.push(`${attempt.label}: running`);
+      return {
+        live: {
+          session,
+          io,
+          output,
+          provider: "wasm",
+          detail: `CPU · ${ort.env.wasm.numThreads ?? 1} thread(s)`,
+        },
+        index,
+        log,
+      };
     } catch (error) {
       lastError = error;
-      onRejected?.(name, error instanceof Error ? error.message : String(error));
+      const reason = error instanceof Error ? error.message : String(error);
+      log.push(`${attempt.label}: ${reason}`);
+      // The most recent GPU failure is the one worth quoting: the ladder tries
+      // the best hardware first, so the last thing it said before giving up is
+      // the most specific answer available.
+      if (attempt.provider === "webgpu") {
+        gpuGaveUp = explainRejection("webgpu", reason, acquired?.report ?? attempt.candidate?.report);
+      } else {
+        onRejected?.(attempt.provider, explainRejection(attempt.provider, reason, undefined));
+      }
       await session?.release?.().catch(() => undefined);
+      acquired?.device.destroy?.();
     }
   }
+
+  const why = gpuGaveUp ?? (lastError === undefined ? "the model file could not be fetched" : String(lastError));
   throw new PolyReadError(
     "modelMissing",
-    `no execution provider could run the model: ${String(lastError)}`,
+    plan.some((attempt) => attempt.provider === "wasm")
+      ? `no execution provider could run the model: ${why}`
+      : `Settings requires the GPU, and no GPU on this machine would run the model. ${why} ` +
+        "Set Compute to GPU first to allow the CPU.",
   );
 }
 
+/**
+ * The duration subgraph, on the same device the acoustic model settled on.
+ *
+ * It shares the device object rather than creating a second one: two devices on
+ * one adapter is two copies of every allocation, and ORT would have to upload
+ * the style vectors to both.
+ */
 async function createDurationSession(
   bytes: Uint8Array,
-  device: string,
+  main: LiveSession,
   config: KokoroEngineConfig,
   vocabulary: KokoroVocabulary,
   voice: Voice,
-): Promise<ResolvedSession | undefined> {
+): Promise<{ session: ort.InferenceSession; io: SessionIO; output: string } | undefined> {
   const label = config.durationModelUrl ?? "duration model";
   // The acoustic model has already proven this device works; try it here, and
   // keep WASM as the backstop so a subgraph the GPU dislikes is a downgrade
   // rather than a lost tier.
   const providers: ort.InferenceSession.ExecutionProviderConfig[][] =
-    device === "wasm" ? [["wasm"]] : [[device], ["wasm"]];
+    main.provider === "webgpu" && main.gpuDevice
+      ? [[{ name: "webgpu", device: main.gpuDevice }], ["wasm"]]
+      : [["wasm"]];
 
   for (const executionProviders of providers) {
     let session: ort.InferenceSession | undefined;
@@ -752,7 +989,7 @@ async function createDurationSession(
       const io = resolveInputs(session, label);
       const output = resolveOutput(session, DURATION_OUTPUT_NAMES, label, "duration");
       await smokeTest(session, io, output, vocabulary, voice);
-      return { session, io, output, device: String(executionProviders[0]) };
+      return { session, io, output };
     } catch {
       await session?.release?.().catch(() => undefined);
     }

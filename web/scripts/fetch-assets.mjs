@@ -7,10 +7,11 @@
  * nothing but its own origin: the desktop builds bundle what lands here, and a
  * self-hosted copy serves it from the same directory as the page.
  *
- *   node scripts/fetch-assets.mjs                 # fp16, the default voices
- *   node scripts/fetch-assets.mjs --dtype q8f16   # smaller, faster on CPU
- *   node scripts/fetch-assets.mjs --dtype fp32    # largest, best on WebGPU
- *   node scripts/fetch-assets.mjs --voices all    # every voice, ~28 MB more
+ *   node scripts/fetch-assets.mjs                  # fp16, the default voices
+ *   node scripts/fetch-assets.mjs --gpu-fallback   # + an fp32 copy for GPUs that refuse fp16
+ *   node scripts/fetch-assets.mjs --dtype q8f16    # smaller, faster on CPU
+ *   node scripts/fetch-assets.mjs --dtype fp32     # largest, runs on every GPU
+ *   node scripts/fetch-assets.mjs --voices all     # every voice, ~28 MB more
  *   node scripts/fetch-assets.mjs --voices-from-npm
  *
  * Nothing here is hardcoded to a filename in the model repository: the file
@@ -41,12 +42,21 @@ const DEFAULT_VOICES = [
 ];
 
 function parseArgs(argv) {
-  const args = { dtype: "fp16", voices: "default", voicesFromNpm: false, force: false, list: false, repo: MODEL_REPO };
+  const args = {
+    dtype: "fp16",
+    voices: "default",
+    voicesFromNpm: false,
+    force: false,
+    list: false,
+    repo: MODEL_REPO,
+    gpuFallback: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--dtype") args.dtype = argv[++i];
     else if (arg === "--voices") args.voices = argv[++i];
     else if (arg === "--voices-from-npm") args.voicesFromNpm = true;
+    else if (arg === "--gpu-fallback") args.gpuFallback = true;
     else if (arg === "--repo") args.repo = argv[++i];
     else if (arg === "--force") args.force = true;
     else if (arg === "--list") args.list = true;
@@ -58,6 +68,9 @@ function parseArgs(argv) {
           "  --list                                 show what the repository publishes, and stop",
           "  --dtype <fp32|fp16|q8|q8f16|q4|q4f16|uint8|uint8f16|FILE>",
           "                                         model precision, or an exact filename (default fp16)",
+          "  --gpu-fallback                         also fetch an fp32 copy as kokoro-gpu.onnx, which",
+          "                                         the app loads on the GPU when the main model is",
+          "                                         refused — instead of dropping to the CPU",
           "  --voices <default|all|a,b,c>           which voices (default: the B-and-better ones)",
           "  --voices-from-npm                      take voices from the kokoro-js package instead of the Hub",
           "  --repo <owner/name>                    a different model repository",
@@ -144,6 +157,8 @@ async function listAndExit(repo) {
   console.log(`\nVoices: ${voices.length} files, about 0.5 MB each`);
   console.log(`  ${voices.slice(0, 6).map((f) => f.slice(7, -4)).join(", ")}${voices.length > 6 ? ", …" : ""}`);
 
+  console.log("\nfp16 is the fastest thing a GPU can run and the one some drivers refuse;");
+  console.log("--gpu-fallback fetches an fp32 copy alongside it so those keep using the GPU.");
   console.log("\nThe same download serves the website and the desktop installers.");
   console.log("Pick one model file and run, for example:");
   console.log("  node scripts/fetch-assets.mjs --dtype fp16");
@@ -267,6 +282,26 @@ async function main() {
       file,
       args.force,
     );
+  }
+
+  // The GPU-compatible spare. fp32 rather than a quantized file on purpose:
+  // int8 graphs fall back to the CPU node by node on the WebGPU provider, which
+  // would defeat the point of fetching it. This is the last rung of the ladder
+  // in `synthesis/kokoroEngine.ts` before synthesis moves to the CPU.
+  if (args.gpuFallback) {
+    const fallbackDtype = args.dtype === "fp32" ? undefined : "fp32";
+    if (!fallbackDtype) {
+      console.log("\nGPU fallback: not needed — fp32 already runs on every GPU.");
+    } else {
+      const fallbackFile = pickModelFile(files, fallbackDtype);
+      console.log(`\nGPU fallback (${fallbackDtype}):`);
+      await download(
+        `${HUB}/${args.repo}/resolve/main/${fallbackFile}`,
+        join(outDir, "kokoro-gpu.onnx"),
+        `kokoro-gpu.onnx (${fallbackFile})`,
+        args.force,
+      );
+    }
   }
 
   console.log("\nTokenizer:");

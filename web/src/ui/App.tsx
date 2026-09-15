@@ -288,8 +288,14 @@ function VoiceNotice({
  * On the CPU backend Kokoro renders at around real time, which means a
  * 45-minute document takes 45 minutes to render and playback never gets far
  * ahead of the listener. That is a different app from the one that runs on a
- * GPU, so when the GPU was refused the reason and the remedy go on the library
- * page rather than into a list of import notes.
+ * GPU, so when every GPU was refused the reason and the remedy go on the
+ * library page rather than into a list of import notes.
+ *
+ * This card only appears once the whole ladder in `kokoroEngine.ts` has been
+ * climbed down — every adapter, with and without graph fusions, and a
+ * GPU-compatible model file if one was fetched. By the time it is on screen
+ * there is nothing left for the app to try on its own, which is why it names a
+ * command rather than a setting.
  */
 function DeviceNotice({
   state,
@@ -300,12 +306,23 @@ function DeviceNotice({
 }): ReactElement | null {
   const notice = state.deviceNotice;
   if (!notice || state.model.kind === "failed") return null;
-  const fp16 = /16-bit shader/.test(notice);
+  // The one remaining remedy, and it is a download rather than a setting: an
+  // fp32 copy of the model, which every GPU with working WebGPU can run.
+  const modelWouldHelp = /16-bit shader|refused the model/.test(notice);
   return (
     <div className="notice">
       <div className="notice-head">Running on the CPU</div>
       <p className="notice-body">{notice}</p>
-      {fp16 && <pre className="notice-code">npm run assets -- --dtype q8</pre>}
+      {modelWouldHelp && (
+        <>
+          <pre className="notice-code">npm run assets -- --gpu-fallback</pre>
+          <p className="notice-body">
+            That fetches an fp32 copy of the voice (310 MB) alongside the one you have and leaves it
+            where PolyRead looks. It is slower than fp16 on a GPU and several times faster than
+            anything on a CPU, and it is only loaded if the GPU refuses the first file.
+          </p>
+        </>
+      )}
       <div className="status-actions">
         <button type="button" onClick={onSettings}>
           Open settings

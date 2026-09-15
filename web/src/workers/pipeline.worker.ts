@@ -140,6 +140,7 @@ function ensureEngine(): Promise<KokoroEngine> {
       {
         modelUrl: configured.modelUrl,
         durationModelUrl: configured.durationModelUrl,
+        gpuFallbackModelUrl: configured.gpuFallbackModelUrl,
         voicesBaseUrl: configured.voicesBaseUrl,
         voiceID: configured.voiceID,
         device: configured.device,
@@ -149,16 +150,23 @@ function ensureEngine(): Promise<KokoroEngine> {
       {
         onProgress: (label, done, total) => post({ type: "model", phase: "loading", label, done, total }),
         beforeCompile: () => readerOpen,
+        // Only fires for the last GPU rung, so by the time it does, every GPU
+        // this machine offers has been tried and refused. That is the sentence
+        // worth putting on screen — not the four that led to it, which are in
+        // the ladder Settings prints.
         onProviderRejected: (provider, reason) =>
           post({
             type: "error",
             kind: "deviceFallback",
-            message: `${provider} compiled the voice model but could not run it, so it is not being used: ${reason}`,
+            message:
+              provider === "webgpu"
+                ? `No GPU on this machine would run the voice model. ${reason}`
+                : `${provider} could not run the voice model: ${reason}`,
           }),
       },
     );
     engine = loaded;
-    post({ type: "model", phase: "ready", label: loaded.device, done: 1, total: 1 });
+    post({ type: "model", phase: "ready", label: loaded.deviceDetail, done: 1, total: 1 });
     return loaded;
   })();
 
@@ -407,13 +415,20 @@ async function startSynthesis(
     return;
   }
   if (coordinator !== target) return;
-  kokoro.onDeviceChange = (device, reason) => {
-    post({ type: "model", phase: "ready", label: device, done: 1, total: 1 });
+  kokoro.onDeviceChange = (detail, reason) => {
+    post({ type: "model", phase: "ready", label: detail, done: 1, total: 1 });
     post({ type: "engine", info: kokoro.info });
+    // Only the drop to the CPU is worth interrupting anyone over. Moving from
+    // one GPU configuration to another is the ladder doing its job, and it is
+    // still a GPU, so it goes into the import notes and not onto the library
+    // page.
     post({
       type: "error",
-      message: `The GPU could not run the voice model, so it moved to the CPU: ${reason}`,
-      kind: "deviceFallback",
+      message:
+        kokoro.device === "wasm"
+          ? `No GPU on this machine would run the voice model, so synthesis moved to the CPU: ${reason}`
+          : `Synthesis moved to ${detail}: ${reason}`,
+      kind: kokoro.device === "wasm" ? "deviceFallback" : "deviceChange",
     });
   };
   target.attachEngine(kokoro);
@@ -575,15 +590,18 @@ async function benchmark(): Promise<string> {
   lines.push("");
   lines.push(kokoro.describeInterfaces());
   lines.push("");
-  lines.push(`Device: ${kokoro.device}`);
+  lines.push(`Device: ${kokoro.deviceDetail}`);
   if (kokoro.adapter) {
-    lines.push(`  adapter: ${kokoro.adapter.description} (${kokoro.adapter.powerPreference})`);
+    lines.push(`  adapter: ${kokoro.adapter.description}`);
+    lines.push(`  kind: ${kokoro.adapter.klass}, requested as ${kokoro.adapter.powerPreference}`);
     lines.push(
       kokoro.adapter.shaderF16
-        ? "  16-bit shaders: supported"
-        : "  16-bit shaders: NOT supported — an fp16 model cannot run on this GPU",
+        ? "  16-bit shaders: enabled on the device"
+        : "  16-bit shaders: NOT available — an fp16 model cannot run on this GPU",
     );
   }
+  lines.push("Compute ladder:");
+  for (const attempt of kokoro.attempts) lines.push(`  ${attempt}`);
   lines.push(
     kokoro.timingSource === "model"
       ? "Timings: exact, from the duration model (§7.2 as specified)"
@@ -647,7 +665,7 @@ async function benchmark(): Promise<string> {
   }
   if (elapsed <= 0) elapsed = (performance.now() - started) / 1000;
   lines.push("");
-  lines.push(`Device in use: ${kokoro.device}`);
+  lines.push(`Device in use: ${kokoro.deviceDetail}`);
   lines.push(`§0.1 throughput: ${renderedSeconds.toFixed(1)} s of audio in ${elapsed.toFixed(1)} s`);
   lines.push(`  realtime multiple: ${(renderedSeconds / elapsed).toFixed(1)}x`);
   if (renderedSeconds < 60) {
