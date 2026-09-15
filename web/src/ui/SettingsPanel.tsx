@@ -21,7 +21,7 @@ export interface SettingsPanelProps {
   onBenchmark(): void;
 }
 
-export function SettingsPanel({ settings, state, onChange, onBenchmark }: SettingsPanelProps): JSX.Element {
+export function SettingsPanel({ settings, state, onChange, onBenchmark }: SettingsPanelProps) {
   const set = <K extends keyof AppSettings>(key: K, value: AppSettings[K]): void =>
     onChange({ ...settings, [key]: value });
 

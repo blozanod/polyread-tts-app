@@ -28,7 +28,7 @@ export interface TransportBarProps {
 
 const RATES = [0.75, 1, 1.25, 1.5, 1.75, 2];
 
-export function TransportBar(props: TransportBarProps): JSX.Element {
+export function TransportBar(props: TransportBarProps) {
   const { time, duration, renderedThrough, playing, rate, exact } = props;
   const trackRef = useRef<HTMLDivElement>(null);
 

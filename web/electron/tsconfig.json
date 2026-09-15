@@ -1,0 +1,17 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "lib": [
+      "ES2022"
+    ],
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "types": [
+      "node"
+    ],
+    "jsx": "react-jsx"
+  },
+  "include": [
+    "."
+  ]
+}

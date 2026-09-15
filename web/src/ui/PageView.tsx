@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import * as pdfjs from "pdfjs-dist";
-import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
+// pdf.js ships two builds. The default one targets browsers newer than any
+// currently shipping: version 6 calls `Map.prototype.getOrInsertComputed`, a
+// proposal method that Chromium 141 still does not have, and page rendering
+// throws `getOrInsertComputed is not a function` on a browser most people are
+// actually running. The `legacy` build is the same library with the polyfills
+// in — about 160 KB more, against the 26 MB of WebAssembly this app already
+// loads, which is not a trade worth thinking about.
+import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
+import pdfWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.mjs?url";
 import type { WordTiming } from "../core/types";
 
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -38,7 +45,7 @@ interface RenderedPage {
   };
 }
 
-export function PageView({ bytes, words, wordIndex, onSeekToWord }: PageViewProps): JSX.Element {
+export function PageView({ bytes, words, wordIndex, onSeekToWord }: PageViewProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const [pages, setPages] = useState<RenderedPage[]>([]);
   const [error, setError] = useState<string>();
@@ -52,7 +59,7 @@ export function PageView({ bytes, words, wordIndex, onSeekToWord }: PageViewProp
 
     void (async () => {
       try {
-        const task = pdfjs.getDocument({ data: new Uint8Array(bytes.slice(0)), isEvalSupported: false });
+        const task = pdfjs.getDocument({ data: new Uint8Array(bytes.slice(0)) });
         const pdf = await task.promise;
         // Rendering every page of a 400-page book up front is minutes of work
         // and hundreds of megabytes of canvas. Pages are rendered around the
@@ -63,21 +70,21 @@ export function PageView({ bytes, words, wordIndex, onSeekToWord }: PageViewProp
           const page = await pdf.getPage(index + 1);
           const viewport = page.getViewport({ scale });
           const canvas = createCanvas(viewport.width, viewport.height);
-          const context = canvas.getContext("2d");
-          if (!context) continue;
-          await page.render({ canvasContext: context, viewport }).promise;
+          await page.render({ canvas, viewport }).promise;
           rendered.push({
             index,
             canvas,
             width: viewport.width,
             height: viewport.height,
             toViewport: (bbox) => {
-              const [x0, y0, x1, y1] = viewport.convertToViewportRectangle([
-                bbox.x,
-                bbox.y,
+              // pdf.js 6 dropped `convertToViewportRectangle`; the two corners
+              // through `convertToViewportPoint` are what it did anyway, and
+              // taking min/max of them survives the y-flip and page rotation.
+              const [x0, y0] = viewport.convertToViewportPoint(bbox.x, bbox.y);
+              const [x1, y1] = viewport.convertToViewportPoint(
                 bbox.x + bbox.width,
                 bbox.y + bbox.height,
-              ]);
+              );
               return {
                 left: Math.min(x0, x1),
                 top: Math.min(y0, y1),
@@ -140,7 +147,7 @@ interface PageCanvasProps {
   onSeekToWord(index: number): void;
 }
 
-function PageCanvas({ page, boxes, words, onSeekToWord }: PageCanvasProps): JSX.Element {
+function PageCanvas({ page, boxes, words, onSeekToWord }: PageCanvasProps) {
   const holder = useRef<HTMLDivElement>(null);
 
   useEffect(() => {

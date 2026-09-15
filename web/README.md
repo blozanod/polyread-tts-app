@@ -11,14 +11,28 @@ local, and after the first setup the app talks to nothing but its own origin.
 
 ## Running it
 
-You need Node 20 or newer.
+Node 20 or newer. Node 24 and npm 11 are what this is currently built against.
 
 ```sh
 cd web
-npm install
+npm install          # 83 packages, no warnings, no vulnerabilities
 npm run assets       # downloads the Kokoro model and voices into public/models
 npm run dev          # http://localhost:5173
 ```
+
+The desktop toolchain is deliberately not part of that install. Electron and
+electron-builder are 280 further packages and every deprecation warning the
+install would otherwise print, and none of it is needed to run, test or build
+the web app. When you want an installer:
+
+```sh
+npm run desktop:setup
+```
+
+That writes them into `package.json` and the lockfile, so they stay put across
+later installs — `git checkout package.json package-lock.json` undoes it if you
+would rather keep the committed state lean. The `dist:*` scripts check for the
+toolchain and point you here if it is missing.
 
 `npm run assets` is a one-time download of about 170 MB. **The same files serve
 the website and the desktop installers** — it writes into `public/models/`, Vite
@@ -91,9 +105,10 @@ turning it up possible on machines where it works.
 ### Building the desktop apps
 
 ```sh
-npm run dist:linux   # AppImage + .deb
-npm run dist:win     # NSIS installer + portable .exe
-npm run dist:mac     # .dmg, arm64 and x64 — needs macOS
+npm run desktop:setup   # once: adds Electron and electron-builder
+npm run dist:linux      # AppImage + .deb
+npm run dist:win        # NSIS installer + portable .exe
+npm run dist:mac        # .dmg, arm64 and x64 — needs macOS
 ```
 
 From WSL Ubuntu, `dist:linux` works directly. `dist:win` needs Wine
@@ -299,6 +314,19 @@ model on CPU.
 **A word is mispronounced.** Proper nouns route through eSpeak's letter-to-sound
 rules — Przeworski and Tocqueville come out about as well as you would expect.
 §11 called a user pronunciation dictionary a v1.1 feature and it still is.
+
+**`npm install` warns about install scripts.** It should not: `allowScripts` in
+`package.json` already vouches for the three that matter (esbuild and protobufjs
+need their platform binaries, Electron needs its runtime) and declines
+tesseract.js's, which only prints a funding notice. If npm asks anyway it is
+older than the policy field; `npm install-scripts approve --all` has the same
+effect.
+
+**"getOrInsertComputed is not a function".** You are on the wrong pdf.js build.
+The app imports `pdfjs-dist/legacy/build/pdf.mjs` on purpose — pdf.js 6's
+default build calls a JavaScript proposal method that Chromium 141 still does
+not have, so page rendering throws on browsers people actually run. The legacy
+build is the same library with the polyfills in.
 
 ## Licence
 

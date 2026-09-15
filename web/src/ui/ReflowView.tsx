@@ -1,3 +1,4 @@
+import type { ReactElement, RefObject } from "react";
 import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import type { ReflowDocument, ReflowParagraph } from "../core/reflow";
 import type { WordTiming } from "../core/types";
@@ -26,7 +27,7 @@ export interface ReflowViewProps {
   onFootnote(blockID: string): void;
 }
 
-export function ReflowView({ reflow, words, wordIndex, onSeekToWord, onFootnote }: ReflowViewProps): JSX.Element {
+export function ReflowView({ reflow, words, wordIndex, onSeekToWord, onFootnote }: ReflowViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const highlightRef = useRef<HTMLSpanElement>(null);
 
@@ -122,7 +123,7 @@ interface ParagraphProps {
   isCurrent: boolean;
   currentWords?: Array<{ index: number; word: WordTiming }>;
   wordIndex: number;
-  highlightRef: React.RefObject<HTMLSpanElement>;
+  highlightRef: RefObject<HTMLSpanElement | null>;
 }
 
 function Paragraph({
@@ -133,7 +134,7 @@ function Paragraph({
   currentWords,
   wordIndex,
   highlightRef,
-}: ParagraphProps): JSX.Element {
+}: ParagraphProps) {
   const { location, length } = paragraph.range;
   const body = text.slice(location, location + length);
   const className = `para para-${paragraph.role}${isCurrent ? " para-current" : ""}`;
@@ -151,7 +152,7 @@ function Paragraph({
         </p>
       );
     }
-    const parts: JSX.Element[] = [];
+    const parts: ReactElement[] = [];
     let cursor = location;
     inside.forEach((marker, i) => {
       if (marker.range.location > cursor) {
@@ -173,7 +174,7 @@ function Paragraph({
   }
 
   // The spoken paragraph, split at word boundaries.
-  const parts: JSX.Element[] = [];
+  const parts: ReactElement[] = [];
   let cursor = location;
   for (const { index, word } of currentWords) {
     const { location: start, length: wordLength } = word.span.reflowRange;
