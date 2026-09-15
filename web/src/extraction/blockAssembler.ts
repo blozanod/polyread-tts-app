@@ -181,8 +181,15 @@ export function tokenizeParagraph(paragraph: readonly Line[], stripLeadingLabel 
 
     // §4.6 — "line-final run ending in `-` or `‐`, next line begins lowercase".
     // The second half of the test needs the next line, so the hyphen is only
-    // dropped once we can see it — a real compound ("nation-state" broken at the
-    // hyphen) keeps its hyphen.
+    // dropped once we can see it.
+    //
+    // Every line-break hyphen is treated as a soft one. A compound that happens
+    // to break at its own hyphen ("nation-state") therefore loses it and is
+    // spoken as one word, which is the right trade: telling the two apart needs
+    // a dictionary, soft hyphens outnumber compounds heavily in justified
+    // academic prose, and "nationstate" is spoken correctly by a G2P that never
+    // sees the spelling anyway. `mergeAcrossPages` applies the same rule at a
+    // page break, so a word broken there comes out identically.
     pendingHyphen = false;
     const last = tokens[tokens.length - 1];
     if (last && isHyphenated(last.text)) {
@@ -231,7 +238,16 @@ export function isHeading(block: ProtoBlock, bodyGlyphHeight: number): boolean {
  * Without it every page break inserts a spurious pause and a chunk boundary
  * mid-sentence.
  */
-export function mergeAcrossPages(blocks: readonly ProtoBlock[]): ProtoBlock[] {
+export function mergeAcrossPages(
+  blocks: readonly ProtoBlock[],
+  /**
+   * Records `absorbed block id -> surviving block id` for every merge, because
+   * a merge makes the absorbed block's id vanish from the result. Anything
+   * still holding on to a block from before this pass — the footnote markers
+   * lifted out of it, most of all — has to be able to follow it.
+   */
+  mergedInto?: Map<string, string>,
+): ProtoBlock[] {
   const result: ProtoBlock[] = [];
   for (const block of blocks) {
     const previous = result[result.length - 1];
@@ -257,10 +273,65 @@ export function mergeAcrossPages(blocks: readonly ProtoBlock[]): ProtoBlock[] {
       continue;
     }
 
-    previous.tokens.push(...block.tokens);
+    // §4.6's hyphenation rule does not stop at the page break. A paragraph
+    // broken mid-word across pages arrives here as "...governmental labora-"
+    // and "tories and industry", and concatenating the token lists leaves two
+    // spoken tokens where the page has one word: the reader says "labora",
+    // takes the paragraph pause the block boundary earns, and then says
+    // "tories". `tokenizeParagraph` joins these within a paragraph and cannot
+    // reach across two of them, and the conditions guarding this merge are
+    // already §4.6's own test — the left side does not end in terminal
+    // punctuation and the right side begins lowercase — so the join belongs
+    // here. One spoken token, both boxes, exactly as `SourceSpan` promises for
+    // a word broken over a line.
+    const last = previous.tokens[previous.tokens.length - 1];
+    const first = block.tokens[0];
+    if (last && first && isHyphenated(last.text)) {
+      last.text = last.text.slice(0, -1) + first.text;
+      last.bboxes.push(...first.bboxes);
+      previous.tokens.push(...block.tokens.slice(1));
+    } else {
+      previous.tokens.push(...block.tokens);
+    }
     previous.lineCount += block.lineCount;
+    mergedInto?.set(block.id, previous.id);
   }
   return result;
+}
+
+/**
+ * Publisher access statements — the page a database staples to the front of a
+ * download, and the notice it repeats on every page after.
+ *
+ * None of it is the document. A JSTOR PDF opens with the article's citation
+ * followed by several hundred words about what JSTOR is, who to contact, and
+ * what the terms of use are, and the reader read every word of it aloud before
+ * reaching the first sentence of the paper. §4.4's furniture test cannot see
+ * this: it is a full-width body-sized paragraph in the middle of the page, not
+ * a running head in the top or bottom 8%, and it appears once rather than
+ * repeating across pages.
+ *
+ * So it is recognized by what it says. The phrases are the fixed legal wording
+ * these services emit, long enough that no paper about scholarship, archives or
+ * terms of use can collide with them by accident — the test is deliberately
+ * narrower than "mentions JSTOR", because suppressing a paragraph the author
+ * wrote is a worse failure than reading one they did not.
+ */
+const BOILERPLATE_PHRASES = [
+  "is a not-for-profit service that helps scholars",
+  "not-for-profit service that helps scholars, researchers, and students",
+  "your use of the jstor archive indicates your acceptance",
+  "terms & conditions of use, available at",
+  "all use subject to",
+  "this content downloaded from",
+  "to digitize, preserve and extend access to",
+  "range of content in a trusted digital archive",
+  "for more information about jstor, please contact",
+];
+
+export function isPublisherBoilerplate(text: string): boolean {
+  const flat = text.toLowerCase().replace(/\s+/gu, " ");
+  return BOILERPLATE_PHRASES.some((phrase) => flat.includes(phrase));
 }
 
 export { maxX };
