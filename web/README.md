@@ -52,21 +52,25 @@ node scripts/fetch-assets.mjs --list
 
 Then pick a precision:
 
-| `--dtype` | Size | Use it when |
-|---|---|---|
-| `fp32` | 310 MB | You have WebGPU and want the best quality |
-| `fp16` | 156 MB | **Default.** Good on WebGPU, fine on CPU |
-| `q8f16` | 82 MB | The smallest one worth having |
-| `q8` | 88 MB | CPU only, or you care about download size |
-| `uint8f16` | 109 MB | |
-| `q4f16` | 147 MB | |
-| `uint8` | 169 MB | |
-| `q4` | 291 MB | |
+| `--dtype` | Size | Needs `shader-f16` | Use it when |
+|---|---|---|---|
+| `fp32` | 310 MB | no | Best quality, and runs on any WebGPU device |
+| `fp16` | 156 MB | **yes** | **Default.** Smaller and quicker where the GPU has 16-bit shaders |
+| `q8f16` | 82 MB | **yes** | The smallest one, where the GPU has 16-bit shaders |
+| `q8` | 88 MB | no | The smallest one that runs on any GPU, and the fastest on CPU |
+| `uint8f16` | 109 MB | **yes** | |
+| `q4f16` | 147 MB | **yes** | |
+| `uint8` | 169 MB | no | |
+| `q4` | 291 MB | no | |
 
 Those are the published sizes, not estimates. Note that the quantized files are
 not ordered the way the names suggest — `q4` is nearly twice `q4f16` and larger
-than `fp16`, because only some of the graph is quantized in each. If you want
-small, `q8f16` is the one.
+than `fp16`, because only some of the graph is quantized in each.
+
+The middle column is the one that decides whether the GPU is used at all: an
+`f16` file on a GPU whose driver does not expose 16-bit shader arithmetic falls
+back to the CPU, which is several times slower. Settings → Benchmark says which
+your GPU is; "If something goes wrong" below has the details.
 
 ```sh
 node scripts/fetch-assets.mjs --dtype q8f16     # smallest, fastest on CPU
@@ -335,13 +339,30 @@ either lacks WebGPU, refused it, or could not run this model on it — the last 
 those shows up as a note beside the import saying so. Failing that, `--dtype q8`
 is the fastest model on CPU.
 
-**It says the GPU could not run the voice model.** Some drivers compile
-Kokoro's graph and then reject the shader for one of its operators, which
-surfaces as `Failed to create a WebGPU compute pipeline` from `OrtRun`. PolyRead
-tests each execution provider with a throwaway inference before committing to
-it, so this ends as a fall back to the CPU rather than as a reader that will not
-play. `--dtype q8` or `--dtype fp32` sometimes gets the GPU back; Settings →
-Device forces the choice.
+**`ShaderModule with 'Clip' label is invalid`, and it fell back to the CPU.**
+Clip has nothing to do with it. ONNX Runtime emits WGSL's `enable f16;` only
+when the GPU device reports the `shader-f16` feature, and then generates `f16`
+code for an fp16 model regardless — so on a GPU without 16-bit shader support
+*every* shader it compiles is invalid, and the error names whichever one was
+compiled first.
+
+The default model is fp16, so this is the combination to avoid. Either of the
+other two runs on any WebGPU device:
+
+```sh
+npm run assets -- --dtype q8      # 88 MB, and the fastest on CPU too
+npm run assets -- --dtype fp32    # 310 MB, best quality
+```
+
+Settings → Benchmark names the adapter and says whether it has 16-bit shaders,
+so you can check before downloading anything.
+
+**It picked the wrong GPU.** On a laptop with an integrated and a discrete GPU,
+`navigator.gpu.requestAdapter()` with no options — which is what ONNX Runtime
+asks for — usually returns the integrated one. PolyRead requests both power
+preferences itself and takes the discrete GPU, unless only the integrated one
+has 16-bit shader support, in which case being able to run the model wins over
+being faster at it. Settings → Benchmark says which it took.
 
 **A word is mispronounced.** Proper nouns route through eSpeak's letter-to-sound
 rules — Przeworski and Tocqueville come out about as well as you would expect.

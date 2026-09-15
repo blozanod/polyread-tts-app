@@ -58,6 +58,15 @@ export interface SessionState {
   waitingForAudio: boolean;
   benchmark?: string;
   diagnostics: string[];
+  /**
+   * Why synthesis is not on the GPU, when it could have been.
+   *
+   * Its own field rather than one of `diagnostics` because it is the
+   * difference between faster than realtime and not, and it has a fix the
+   * person can act on — so it belongs where they will see it rather than
+   * behind "n import notes".
+   */
+  deviceNotice?: string;
 }
 
 export type ModelStatus =
@@ -418,6 +427,7 @@ export class Session {
         if (event.kind === "deviceFallback") {
           if (!this.engineNotes.includes(event.message)) this.engineNotes.push(event.message);
           this.patch({
+            deviceNotice: event.message,
             diagnostics: [...this.engineNotes, ...(this.state.document?.diagnostics ?? [])],
           });
           break;

@@ -270,6 +270,14 @@ export function SettingsSheet({
                 {state.engine.timingSource === "model" ? "exact" : "estimated"}
               </p>
             )}
+            {state.engine?.adapter && (
+              <p className="storage-line">
+                GPU: {state.engine.adapter.description} ·{" "}
+                {state.engine.adapter.shaderF16
+                  ? "16-bit shaders supported"
+                  : "no 16-bit shaders — fp16 models cannot run on it"}
+              </p>
+            )}
             {state.benchmark && <pre className="report">{state.benchmark}</pre>}
           </details>
         </section>

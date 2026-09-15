@@ -576,6 +576,14 @@ async function benchmark(): Promise<string> {
   lines.push(kokoro.describeInterfaces());
   lines.push("");
   lines.push(`Device: ${kokoro.device}`);
+  if (kokoro.adapter) {
+    lines.push(`  adapter: ${kokoro.adapter.description} (${kokoro.adapter.powerPreference})`);
+    lines.push(
+      kokoro.adapter.shaderF16
+        ? "  16-bit shaders: supported"
+        : "  16-bit shaders: NOT supported — an fp16 model cannot run on this GPU",
+    );
+  }
   lines.push(
     kokoro.timingSource === "model"
       ? "Timings: exact, from the duration model (§7.2 as specified)"

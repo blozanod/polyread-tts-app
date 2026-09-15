@@ -58,6 +58,97 @@ export function defaultThreadCount(cores: number, isolated = isCrossOriginIsolat
   return Math.max(1, Math.min(4, cores - 1));
 }
 
+/**
+ * The parts of the WebGPU API this file uses, declared locally.
+ *
+ * `@webgpu/types` is not a dependency and `lib.dom` does not carry these yet,
+ * and the alternative — `any` at every call site — is how the adapter got
+ * picked by accident in the first place.
+ */
+interface GpuAdapterLike {
+  features: { has(feature: string): boolean };
+  info?: { vendor?: string; architecture?: string; device?: string; description?: string };
+  requestAdapterInfo?: () => Promise<GpuAdapterLike["info"]>;
+}
+
+interface GpuLike {
+  requestAdapter(options?: { powerPreference?: "high-performance" | "low-power" }): Promise<GpuAdapterLike | null>;
+}
+
+/** What the chosen adapter is, and what it can do. Reported in Settings. */
+export interface AdapterReport {
+  /** Vendor and device as the browser describes them. */
+  description: string;
+  /**
+   * Whether the driver exposes 16-bit shader arithmetic.
+   *
+   * This decides whether an fp16 model can run on the GPU at all. ONNX Runtime
+   * emits `enable f16;` only when the device has `shader-f16`, and then
+   * generates `f16` WGSL for an fp16 model regardless — so without the feature
+   * every shader it compiles is invalid, and the first one to be compiled is
+   * the one named in the error. That is what
+   * `ShaderModule with 'Clip' label is invalid` means: not a problem with Clip.
+   */
+  shaderF16: boolean;
+  powerPreference: "high-performance" | "low-power";
+  /** True when the two power preferences resolved to different hardware. */
+  hadChoice: boolean;
+}
+
+/**
+ * Picks the GPU, rather than letting the default pick it.
+ *
+ * ONNX Runtime asks for `navigator.gpu.requestAdapter()` with no options, and
+ * on a laptop with both an integrated and a discrete GPU the browser's answer
+ * to that is usually the integrated one — so PolyRead was running Kokoro on an
+ * Iris Xe while an RTX sat idle, which is most of the difference between
+ * faster than realtime and not.
+ *
+ * `shader-f16` outranks raw speed here because it is the difference between the
+ * GPU running the model and not running it at all.
+ */
+export async function selectAdapter(
+  gpu: GpuLike | undefined,
+): Promise<{ adapter: GpuAdapterLike; report: AdapterReport } | undefined> {
+  if (!gpu?.requestAdapter) return undefined;
+
+  const candidates: Array<{ adapter: GpuAdapterLike; powerPreference: "high-performance" | "low-power" }> = [];
+  for (const powerPreference of ["high-performance", "low-power"] as const) {
+    try {
+      const adapter = await gpu.requestAdapter({ powerPreference });
+      if (adapter) candidates.push({ adapter, powerPreference });
+    } catch {
+      // An adapter that cannot be requested is one fewer candidate, not a failure.
+    }
+  }
+  if (candidates.length === 0) return undefined;
+
+  const scored = candidates.map((candidate) => ({
+    ...candidate,
+    shaderF16: candidate.adapter.features.has("shader-f16"),
+  }));
+  scored.sort((a, b) => {
+    if (a.shaderF16 !== b.shaderF16) return a.shaderF16 ? -1 : 1;
+    return a.powerPreference === "high-performance" ? -1 : 1;
+  });
+
+  const best = scored[0];
+  const info = best.adapter.info ?? (await best.adapter.requestAdapterInfo?.().catch(() => undefined));
+  const described = [info?.vendor, info?.architecture, info?.device, info?.description]
+    .filter((part) => typeof part === "string" && part.length > 0)
+    .join(" ");
+
+  return {
+    adapter: best.adapter,
+    report: {
+      description: described || "unnamed adapter",
+      shaderF16: best.shaderF16,
+      powerPreference: best.powerPreference,
+      hadChoice: scored.length > 1 && scored[0].shaderF16 !== scored[1].shaderF16,
+    },
+  };
+}
+
 function configureRuntime(threads?: number): void {
   const cores = typeof navigator !== "undefined" ? (navigator.hardwareConcurrency ?? 2) : 2;
   ort.env.wasm.numThreads = Math.max(1, Math.min(threads ?? defaultThreadCount(cores), cores));
@@ -123,6 +214,7 @@ export interface EngineInfo {
   timingSource: ChunkTiming["source"];
   modelInterface: string;
   voiceID: string;
+  adapter?: AdapterReport;
 }
 
 export class KokoroEngine {
@@ -138,6 +230,7 @@ export class KokoroEngine {
   private readonly config: KokoroEngineConfig;
   /** Set once the GPU has been abandoned, so the rebuild is attempted once. */
   private cpuFallback: Promise<boolean> | undefined;
+  readonly adapter: AdapterReport | undefined;
   readonly calibration = new Calibration();
   device: string;
   /** Set when a chunk's rendered length disagreed with the duration model. */
@@ -156,6 +249,7 @@ export class KokoroEngine {
     vocabulary: KokoroVocabulary;
     device: string;
     config: KokoroEngineConfig;
+    adapter?: AdapterReport;
   }) {
     this.model = init.model;
     this.modelIO = init.modelIO;
@@ -168,6 +262,7 @@ export class KokoroEngine {
     this.weights = new DurationWeights(init.vocabulary);
     this.device = init.device;
     this.config = init.config;
+    this.adapter = init.adapter;
   }
 
   static async load(
@@ -188,6 +283,22 @@ export class KokoroEngine {
 
     await beforeCompile?.();
 
+    // Picked here rather than at the top of the load: ONNX Runtime reads this
+    // when it creates the session, and an adapter handed over minutes earlier —
+    // across a few hundred megabytes of download — may have gone stale by then.
+    let adapter: AdapterReport | undefined;
+    if ((config.device ?? "auto") !== "wasm") {
+      const gpu = (globalThis.navigator as { gpu?: GpuLike } | undefined)?.gpu;
+      const chosen = await selectAdapter(gpu);
+      if (chosen) {
+        adapter = chosen.report;
+        const webgpu = ort.env.webgpu as { adapter?: unknown; powerPreference?: string };
+        webgpu.adapter = chosen.adapter;
+        // Honoured by builds that ignore `adapter`; harmless where it is not.
+        webgpu.powerPreference = chosen.report.powerPreference;
+      }
+    }
+
     // Compiling a few hundred megabytes of graph is the longest stretch of the
     // load with nothing to report, so it gets its own label.
     onProgress?.(COMPILE_LABEL, 0, 1);
@@ -197,7 +308,7 @@ export class KokoroEngine {
       config,
       vocabulary,
       voice,
-      onProviderRejected,
+      (provider, reason) => onProviderRejected?.(provider, explainRejection(provider, reason, adapter)),
     );
 
     // The duration subgraph runs once per chunk and shares the acoustic model's
@@ -220,6 +331,7 @@ export class KokoroEngine {
       vocabulary,
       device: main.device,
       config,
+      adapter,
     });
   }
 
@@ -233,6 +345,7 @@ export class KokoroEngine {
       timingSource: this.timingSource,
       modelInterface: this.describeInterfaces(),
       voiceID: this.voice.name,
+      adapter: this.adapter,
     };
   }
 
@@ -521,6 +634,38 @@ function distributeSegment(frames: readonly number[], target: number): number[] 
 }
 
 // MARK: - Session plumbing
+
+/**
+ * Turns a provider's rejection into something that names the cause.
+ *
+ * `Failed to create a WebGPU compute pipeline: ShaderModule with 'Clip' label
+ * is invalid` is a true statement about a shader and a useless one about the
+ * problem. When the chosen adapter has no `shader-f16`, the cause is that the
+ * model is float16 and the driver cannot do 16-bit shader arithmetic — every
+ * shader would have failed, and Clip is simply the first one compiled. That has
+ * a fix, and the fix is a different model file rather than a different GPU.
+ */
+export function explainRejection(
+  provider: string,
+  reason: string,
+  adapter: AdapterReport | undefined,
+): string {
+  if (provider !== "webgpu") return `${provider}: ${reason}`;
+  if (!adapter) return `webgpu: ${reason}`;
+  if (!adapter.shaderF16) {
+    return (
+      `The GPU (${adapter.description}) does not support 16-bit shader arithmetic, ` +
+      "so it cannot run an fp16 model — which is the default one. " +
+      'Re-fetch a model it can run with "npm run assets -- --dtype q8" (88 MB) or ' +
+      '"npm run assets -- --dtype fp32" (310 MB), and the GPU will be used. ' +
+      `Until then synthesis runs on the CPU. The underlying error was: ${reason}`
+    );
+  }
+  return (
+    `The GPU (${adapter.description}) reports 16-bit shader support but still refused the model, ` +
+    `so synthesis runs on the CPU: ${reason}`
+  );
+}
 
 function providersFor(device: KokoroEngineConfig["device"]): ort.InferenceSession.ExecutionProviderConfig[][] {
   const wanted = device ?? "auto";
