@@ -31,9 +31,23 @@ export const COMPILE_LABEL = "Preparing the model";
 export interface EngineSettings {
   modelUrl: string;
   durationModelUrl?: string;
+  /**
+   * A model the GPU is known to be able to run, tried before the CPU is.
+   *
+   * `npm run assets -- --gpu-fallback` puts one here. Nothing breaks without
+   * it — the path simply 404s and the ladder moves on — so it stays pointed at
+   * the file whether or not anyone has fetched it.
+   */
+  gpuFallbackModelUrl?: string;
   voicesBaseUrl: string;
   vocabUrl?: string;
   voiceID: string;
+  /**
+   * Which processor synthesis may use.
+   *
+   * `"auto"` is every GPU this machine has and then the CPU; `"webgpu"` is the
+   * GPU or an error; `"wasm"` is the CPU by choice.
+   */
   device: "auto" | "webgpu" | "wasm";
   /** CPU threads for the WebAssembly backend; 0 leaves it to the engine. */
   threads: number;

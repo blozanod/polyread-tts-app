@@ -24,6 +24,7 @@ export interface AppSettings extends EngineSettings {
 export const DEFAULT_SETTINGS: AppSettings = {
   modelUrl: "models/kokoro.onnx",
   durationModelUrl: "models/kokoro-duration.onnx",
+  gpuFallbackModelUrl: "models/kokoro-gpu.onnx",
   voicesBaseUrl: "models/voices",
   vocabUrl: "models/tokenizer.json",
   voiceID: DEFAULT_VOICE,
@@ -81,6 +82,9 @@ export function engineSettingsOf(settings: AppSettings): EngineSettings {
   return {
     modelUrl: resolveAgainstPage(settings.modelUrl),
     durationModelUrl: settings.durationModelUrl ? resolveAgainstPage(settings.durationModelUrl) : undefined,
+    gpuFallbackModelUrl: settings.gpuFallbackModelUrl
+      ? resolveAgainstPage(settings.gpuFallbackModelUrl)
+      : undefined,
     voicesBaseUrl: resolveAgainstPage(settings.voicesBaseUrl),
     vocabUrl: settings.vocabUrl ? resolveAgainstPage(settings.vocabUrl) : undefined,
     voiceID: settings.voiceID,

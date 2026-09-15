@@ -1,8 +1,73 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { createReadStream } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { extname, join, normalize, resolve, sep } from "node:path";
 import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from "electron";
+
+/**
+ * Point Chromium at the fastest GPU in the machine, before it starts.
+ *
+ * The renderer can rank the adapters it is offered — `synthesis/gpu.ts` does —
+ * but it cannot conjure one Chromium did not initialize. On a laptop with
+ * switchable graphics the browser process decides which physical GPU its GPU
+ * process talks to, and left alone it decides in favour of battery life. So
+ * these are set here, in the only place they can be: before `app.whenReady()`,
+ * because Chromium reads its command line once and the GPU process is already
+ * running by the time a window exists.
+ *
+ * What each is for:
+ *
+ *  - `force_high_performance_gpu` is the one that matters. It is what makes
+ *    `requestAdapter({ powerPreference: "high-performance" })` return the
+ *    discrete card on macOS and Windows rather than the integrated one.
+ *  - `ignore-gpu-blocklist` keeps a driver Chromium distrusts for *rendering*
+ *    reasons — the blocklist is largely about video decode and canvas
+ *    corruption — from taking compute with it. Synthesis is a compute shader
+ *    writing into a buffer we read back; nothing it does reaches the screen.
+ *  - `enable-unsafe-webgpu` turns WebGPU on where it is still behind a flag,
+ *    which on Linux it may be, and unlocks the adapter toggles Dawn keeps
+ *    behind it.
+ *  - `allow_unsafe_apis` is Dawn's own gate, and ONNX Runtime's subgroup
+ *    kernels — the fast path for every reduction in the model — are behind it.
+ *  - `Vulkan` is how Dawn reaches the GPU on Linux at all.
+ *
+ * `POLYREAD_GPU=off` turns the whole thing off and runs on the CPU, which is
+ * what you want on a machine whose driver is the problem.
+ */
+function configureGpu(): void {
+  const preference = (process.env.POLYREAD_GPU ?? "").toLowerCase();
+  if (preference === "off" || preference === "cpu") {
+    app.disableHardwareAcceleration();
+    return;
+  }
+
+  app.commandLine.appendSwitch("force_high_performance_gpu");
+  app.commandLine.appendSwitch("ignore-gpu-blocklist");
+  app.commandLine.appendSwitch("enable-unsafe-webgpu");
+  app.commandLine.appendSwitch("enable-dawn-features", "allow_unsafe_apis");
+  if (process.platform === "linux") {
+    app.commandLine.appendSwitch("enable-features", "Vulkan");
+  }
+
+  // A GPU reset — a driver timeout under a long render is the realistic way to
+  // get one — otherwise has Chromium blocklist 3D for this origin, and the app
+  // spends the rest of its life on the CPU without saying so.
+  app.disableDomainBlockingFor3DAPIs();
+
+  // NVIDIA's PRIME offload on Linux is not a Chromium switch: it is three
+  // environment variables read by the GLX and Vulkan loaders when the process
+  // starts. Without them an Optimus laptop hands out the Intel iGPU and there
+  // is no adapter to rank. They are set only where an NVIDIA driver is
+  // actually loaded, because on a machine without one they would point the
+  // loader at a vendor library that is not there.
+  if (process.platform === "linux" && existsSync("/proc/driver/nvidia/version")) {
+    process.env.__NV_PRIME_RENDER_OFFLOAD = "1";
+    process.env.__GLX_VENDOR_LIBRARY_NAME = "nvidia";
+    process.env.__VK_LAYER_NV_optimus = "NVIDIA_only";
+  }
+}
+
+configureGpu();
 
 /**
  * The desktop shell.
