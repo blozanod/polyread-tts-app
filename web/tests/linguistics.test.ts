@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import { tokensOf } from "../src/core/spanInvariant";
 import { newID, textRange, type Block } from "../src/core/types";
 import { BUDGET, Chunker, isSentenceEnd, splitChunks } from "../src/linguistics/chunker";
-import { alignGroupsToTokens, allowedGroupRange, EspeakPhonemizer } from "../src/linguistics/espeakPhonemizer";
+import {
+  alignGroupsToTokens,
+  alignTokens,
+  allowedGroupRange,
+  EspeakPhonemizer,
+} from "../src/linguistics/espeakPhonemizer";
 import { unencodableEntries, homographPhonemes } from "../src/linguistics/homographs";
 import { normalizeText, postProcessPhonemes, splitOnPunctuation } from "../src/linguistics/kokoroText";
 import { affixes, normalize } from "../src/linguistics/normalizer";
@@ -162,6 +167,48 @@ describe("word alignment", () => {
     // structural ranges, so the caller must fall back to per-token.
     expect(alignGroupsToTokens(["a", "b", "c", "d"], Array.from({ length: 20 }, () => "x"))).toBeUndefined();
   });
+
+  it("names the tokens eSpeak welded together instead of only refusing", () => {
+    // eSpeak runs short function words into one group: "of the" comes back as
+    // a single `ʌvðə`. Strictly there is no alignment, and the merge-aware pass
+    // is what says *which* two tokens to redo rather than the whole paragraph.
+    const tokens = ["the", "vote", "of", "the", "assembly"];
+    const groups = ["ðə", "vˈoʊt", "ʌvðə", "ɐsˈɛmbli"];
+    expect(alignGroupsToTokens(tokens, groups)).toBeUndefined();
+
+    const loose = alignTokens(tokens, groups, { allowMerges: true });
+    expect(loose).toBeDefined();
+    expect(loose!.counts.reduce((a, b) => a + b, 0)).toBe(groups.length);
+    expect(loose!.counts.filter((c) => c === 0).length).toBe(1);
+  });
+
+  it("refuses a table too large to be worth solving", () => {
+    // A scan that came back without spaces can produce thousands of both, and
+    // the table is (tokens x groups) doubles. Per-token phonemization is 1:1 by
+    // construction, so it is the right answer here, not a consolation prize.
+    const many = Array.from({ length: 3000 }, () => "word");
+    expect(alignTokens(many, many.concat(many))).toBeUndefined();
+  });
+});
+
+describe("§0.3 word grouping survives eSpeak's merges", () => {
+  it("returns one non-empty phoneme string per token where words run together", async () => {
+    const phonemizer = new EspeakPhonemizer();
+    // "that the" and "of the" are the pair eSpeak merges most often, and this
+    // sentence used to fall all the way back to per-token phonemization.
+    const text = "The record shows that the record of the vote was recorded by a clerk.";
+    const tokens = tokensOf(text);
+    const words = await phonemizer.phonemize(tokens, []);
+
+    expect(words.length).toBe(tokens.length);
+    for (const word of words) {
+      expect(word.phonemes.length, JSON.stringify(word.token)).toBeGreaterThan(0);
+    }
+    // The context-sensitive reading survives for the words around the merge:
+    // the noun "record" is stressed on its first syllable, the verb on its
+    // second, and both appear here.
+    expect(words[1].phonemes).not.toBe(words[10].phonemes);
+  }, 60_000);
 });
 
 describe("§6.2 chunking", () => {

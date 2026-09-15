@@ -411,8 +411,12 @@ function Reader({
  */
 function transportNote(state: SessionState): string | undefined {
   if (state.model.kind === "failed") return "No voice model — playback is unavailable";
+  // The reader now opens while the model is still loading, so this has to come
+  // before the waiting-for-audio note: "playback resumes on its own" is true
+  // either way, but it is not what someone wants to read for the minute the
+  // model takes.
+  if (state.model.kind === "loading") return "Loading the voice model — playback starts when it lands";
   if (state.waitingForAudio) return "Rendering this passage — playback resumes on its own";
-  if (state.model.kind === "loading") return "Loading the voice model";
   if (state.priming && !state.renderComplete) {
     return `Rendering ahead — ${Math.round(state.priming.seconds)}s of ${Math.round(state.priming.target)}s ready`;
   }

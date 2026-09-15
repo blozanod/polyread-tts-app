@@ -1,3 +1,4 @@
+import { SAMPLES_PER_FRAME } from "../core/frameMath";
 import type { DocumentSidecar } from "../core/sidecar";
 
 /**
@@ -18,9 +19,22 @@ import type { DocumentSidecar } from "../core/sidecar";
  * no encode latency in either direction.
  */
 const DB_NAME = "polyread";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const SIDECARS = "sidecars";
 const AUDIO = "audio";
+/**
+ * One tiny record per rendered chunk: its length in frames and in bytes.
+ *
+ * It exists because the two things the rest of the app asks about rendered
+ * audio — how much of it there is, and how long each chunk turned out — both
+ * used to be answered by reading every sample back out of IndexedDB.
+ * `list()` alone did that twice per call (once for the library, once for the
+ * storage figure it triggers), so opening a document with a couple of hours
+ * cached pulled hundreds of megabytes through the worker to add up some
+ * `byteLength`s. IndexedDB has no way to read a field without its record, so
+ * the field gets its own record.
+ */
+const CHUNKS = "chunkMeta";
 const ORIGINAL = "originals";
 
 export interface LibraryEntry {
@@ -45,10 +59,26 @@ interface AudioRecord {
   samples: Int16Array;
 }
 
+interface ChunkMeta {
+  key: string;
+  contentHash: string;
+  chunkIndex: number;
+  /** 25 ms frames, so a replayed timeline can be re-anchored to real audio. */
+  frames: number;
+  bytes: number;
+}
+
+/** What a caller needs to know about audio already on disk. */
+export interface RenderedChunk {
+  index: number;
+  frames: number;
+  bytes: number;
+}
+
 function open(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onupgradeneeded = () => {
+    request.onupgradeneeded = (event) => {
       const db = request.result;
       if (!db.objectStoreNames.contains(SIDECARS)) {
         db.createObjectStore(SIDECARS, { keyPath: "contentHash" });
@@ -59,6 +89,17 @@ function open(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(ORIGINAL)) {
         db.createObjectStore(ORIGINAL, { keyPath: "contentHash" });
+      }
+      if (!db.objectStoreNames.contains(CHUNKS)) {
+        const store = db.createObjectStore(CHUNKS, { keyPath: "key" });
+        store.createIndex("contentHash", "contentHash", { unique: false });
+      }
+      // Audio written before version 2 has no length record, and there is no
+      // cheap way to make one — reading it back is the cost this store exists
+      // to avoid. It is a regenerable cache and the sidecars beside it are
+      // kept, so the documents stay in the library and re-render on demand.
+      if ((event.oldVersion ?? 0) < 2 && (event.oldVersion ?? 0) > 0) {
+        request.transaction?.objectStore(AUDIO).clear();
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -161,16 +202,26 @@ export class DocumentStore {
       read.objectStore(SIDECARS).getAll() as IDBRequest<Array<LibraryEntry & { sidecar: DocumentSidecar }>>,
     );
 
-    const entries: LibraryEntry[] = [];
-    for (const record of records) {
-      // One transaction per document: the loop awaits, so they cannot share one.
-      const audioTx = db.transaction(AUDIO, "readonly");
-      const audio = await promisify<AudioRecord[]>(
-        audioTx.objectStore(AUDIO).index("contentHash").getAll(record.contentHash) as IDBRequest<AudioRecord[]>,
-      );
-      let bytes = 0;
-      for (const chunk of audio) bytes += chunk.samples.byteLength;
-      entries.push({
+    // One pass over the length records — kilobytes — rather than one pass per
+    // document over its audio.
+    const meta = db.transaction(CHUNKS, "readonly");
+    const allChunks = await promisify<ChunkMeta[]>(
+      meta.objectStore(CHUNKS).getAll() as IDBRequest<ChunkMeta[]>,
+    );
+    const byHash = new Map<string, { bytes: number; count: number }>();
+    for (const chunk of allChunks) {
+      const totals = byHash.get(chunk.contentHash);
+      if (totals) {
+        totals.bytes += chunk.bytes;
+        totals.count += 1;
+      } else {
+        byHash.set(chunk.contentHash, { bytes: chunk.bytes, count: 1 });
+      }
+    }
+
+    const entries: LibraryEntry[] = records.map((record) => {
+      const totals = byHash.get(record.contentHash);
+      return {
         contentHash: record.contentHash,
         title: record.title,
         pageCount: record.pageCount,
@@ -179,24 +230,33 @@ export class DocumentStore {
         timingSource: record.timingSource,
         createdAt: record.createdAt,
         lastOpenedAt: record.lastOpenedAt,
-        audioBytes: bytes,
-        renderedChunks: audio.length,
+        audioBytes: totals?.bytes ?? 0,
+        renderedChunks: totals?.count ?? 0,
         totalChunks: record.totalChunks,
         hasOriginal: record.hasOriginal,
-      });
-    }
+      };
+    });
     return entries.sort((a, b) => b.lastOpenedAt - a.lastOpenedAt);
   }
 
   async putAudio(contentHash: string, chunkIndex: number, samples: Float32Array): Promise<void> {
     const db = await this.database();
-    const transaction = db.transaction(AUDIO, "readwrite");
+    const encoded = toInt16(samples);
+    const transaction = db.transaction([AUDIO, CHUNKS], "readwrite");
+    const key = audioKey(contentHash, chunkIndex);
     transaction.objectStore(AUDIO).put({
-      key: audioKey(contentHash, chunkIndex),
+      key,
       contentHash,
       chunkIndex,
-      samples: toInt16(samples),
+      samples: encoded,
     } satisfies AudioRecord);
+    transaction.objectStore(CHUNKS).put({
+      key,
+      contentHash,
+      chunkIndex,
+      frames: Math.floor(encoded.length / SAMPLES_PER_FRAME),
+      bytes: encoded.byteLength,
+    } satisfies ChunkMeta);
     await done(transaction);
   }
 
@@ -209,16 +269,16 @@ export class DocumentStore {
     return record ? toFloat32(record.samples) : undefined;
   }
 
-  async renderedChunkIndices(contentHash: string): Promise<number[]> {
+  /** What is already on disk for a document, with the lengths it really has. */
+  async renderedChunks(contentHash: string): Promise<RenderedChunk[]> {
     const db = await this.database();
-    const transaction = db.transaction(AUDIO, "readonly");
-    const keys = await promisify<IDBValidKey[]>(
-      transaction.objectStore(AUDIO).index("contentHash").getAllKeys(contentHash),
+    const transaction = db.transaction(CHUNKS, "readonly");
+    const records = await promisify<ChunkMeta[]>(
+      transaction.objectStore(CHUNKS).index("contentHash").getAll(contentHash) as IDBRequest<ChunkMeta[]>,
     );
-    return keys
-      .map((key) => Number(String(key).split(":")[1]))
-      .filter((n) => Number.isFinite(n))
-      .sort((a, b) => a - b);
+    return records
+      .map((record) => ({ index: record.chunkIndex, frames: record.frames, bytes: record.bytes }))
+      .sort((a, b) => a.index - b.index);
   }
 
   /** The PDF itself, so the page view and a re-import work offline. */
@@ -250,14 +310,23 @@ export class DocumentStore {
   /** Drops only the rendered audio, keeping the timeline so a reopen is instant. */
   async removeAudio(contentHash: string): Promise<void> {
     const db = await this.database();
-    const read = db.transaction(AUDIO, "readonly");
-    const keys = await promisify<IDBValidKey[]>(
-      read.objectStore(AUDIO).index("contentHash").getAllKeys(contentHash),
-    );
+    const read = db.transaction([AUDIO, CHUNKS], "readonly");
+    const [audioKeys, metaKeys] = await Promise.all([
+      promisify<IDBValidKey[]>(read.objectStore(AUDIO).index("contentHash").getAllKeys(contentHash)),
+      promisify<IDBValidKey[]>(read.objectStore(CHUNKS).index("contentHash").getAllKeys(contentHash)),
+    ]);
+    // Both stores, from both key sets: a length record left behind by a
+    // half-written chunk would otherwise keep counting against the cache cap
+    // forever, with no audio to show for it.
+    const keys = [...new Set([...audioKeys, ...metaKeys].map(String))];
     if (keys.length === 0) return;
-    const write = db.transaction(AUDIO, "readwrite");
-    const store = write.objectStore(AUDIO);
-    for (const key of keys) store.delete(key);
+    const write = db.transaction([AUDIO, CHUNKS], "readwrite");
+    const audio = write.objectStore(AUDIO);
+    const meta = write.objectStore(CHUNKS);
+    for (const key of keys) {
+      audio.delete(key);
+      meta.delete(key);
+    }
     await done(write);
   }
 

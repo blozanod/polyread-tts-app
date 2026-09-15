@@ -111,9 +111,10 @@ Cross-Origin-Embedder-Policy: require-corp
 ```
 
 on that directory. Without them the multi-threaded CPU backend is not available
-at all. It is off by default anyway — see Settings → CPU threads, and the note
-in `src/synthesis/kokoroEngine.ts` about why — but the headers are what make
-turning it up possible on machines where it works.
+at all, and synthesis runs about four times slower than it needs to. With them
+PolyRead uses several threads by itself; the desktop builds serve themselves
+over a local HTTP server for no other reason than to send these two headers.
+Settings → CPU threads overrides the choice either way.
 
 ### Building the desktop apps
 
@@ -150,10 +151,18 @@ output, `waveform`. The duration predictor is still inside it, but an ONNX
 Runtime session will only hand back graph outputs, so there is no way to ask for
 it. That leaves two tiers, and the app tells you which one it is in:
 
-**Exact** — you ran `make-duration-model.py`. §7.2's Phase A works as specified:
-the whole document is timed before a single sample of audio is rendered, so the
-scrubber, the total duration and every word boundary are right immediately, and
-seeking anywhere is instant.
+**Exact** — you ran `make-duration-model.py`. Every word boundary comes from the
+model rather than from arithmetic, so the scrubber, the total duration and the
+highlight are all exact.
+
+The duration pass runs *behind* the reader rather than in front of it, which is
+a departure from §7.2 and a deliberate one: the subgraph is most of Kokoro's
+text encoder, and a document's worth of it on the CPU backend is several
+minutes — minutes spent staring at a loading bar instead of at the document the
+timeline is describing. So the reader opens on the estimated timeline
+immediately and the exact pass walks the document from the front, staying ahead
+of the audio, replacing each estimate before anything can reach it. The reader
+says "~" in front of the total for as long as any of it is still an estimate.
 
 **Estimated** — you did not. A chunk's *total* length is still known exactly the
 moment it is rendered (the waveform is `frames × 600` samples), so the timeline
@@ -315,14 +324,24 @@ is for that.
 **The import stops partway through loading the model.** ONNX Runtime's
 multi-threaded CPU backend starts its threads as workers, and the pipeline
 already runs in one — nested workers hang on some browser builds rather than
-failing. PolyRead ships with one thread for that reason, notices a stall after a
-minute and retries on one anyway. If you raised the thread count in Settings,
-put it back.
+failing. PolyRead only asks for more than one thread where the page is
+cross-origin isolated, which is the case they work in, and it notices a stall
+and retries on a single thread anyway. If you raised the thread count in
+Settings by hand, put it back.
 
 **It is slow.** Check Settings → Benchmark for which device it picked. WebGPU is
 several times faster than the CPU backend; if it says `wasm`, your browser
-either lacks WebGPU or refused it. Failing that, `--dtype q8` is the fastest
-model on CPU.
+either lacks WebGPU, refused it, or could not run this model on it — the last of
+those shows up as a note beside the import saying so. Failing that, `--dtype q8`
+is the fastest model on CPU.
+
+**It says the GPU could not run the voice model.** Some drivers compile
+Kokoro's graph and then reject the shader for one of its operators, which
+surfaces as `Failed to create a WebGPU compute pipeline` from `OrtRun`. PolyRead
+tests each execution provider with a throwaway inference before committing to
+it, so this ends as a fall back to the CPU rather than as a reader that will not
+play. `--dtype q8` or `--dtype fp32` sometimes gets the GPU back; Settings →
+Device forces the choice.
 
 **A word is mispronounced.** Proper nouns route through eSpeak's letter-to-sound
 rules — Przeworski and Tocqueville come out about as well as you would expect.

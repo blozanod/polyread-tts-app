@@ -250,3 +250,26 @@ describe("§7.4 audio storage", () => {
     expect(clipped[1]).toBe(-32767);
   });
 });
+
+/**
+ * `electron/main.ts` runs a local HTTP server for one reason: the COOP and COEP
+ * headers that make the page cross-origin isolated, which is what lets ONNX
+ * Runtime use more than one WASM thread. The engine was meanwhile pinning the
+ * thread count to one everywhere, so that server bought nothing and CPU
+ * synthesis ran about four times slower than the machine could manage.
+ */
+describe("wasm thread count", () => {
+  it("stays at one thread where SharedArrayBuffer is not available", async () => {
+    const { defaultThreadCount } = await import("../src/synthesis/kokoroEngine");
+    expect(defaultThreadCount(8, false)).toBe(1);
+    expect(defaultThreadCount(1, false)).toBe(1);
+  });
+
+  it("leaves a core free and caps at four where it is", async () => {
+    const { defaultThreadCount } = await import("../src/synthesis/kokoroEngine");
+    expect(defaultThreadCount(2, true)).toBe(1);
+    expect(defaultThreadCount(4, true)).toBe(3);
+    expect(defaultThreadCount(16, true)).toBe(4);
+    expect(defaultThreadCount(1, true)).toBe(1);
+  });
+});

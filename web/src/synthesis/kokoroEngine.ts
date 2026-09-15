@@ -3,6 +3,7 @@ import { PolyReadError } from "../core/errors";
 import { roundedFramesAll, SAMPLES_PER_FRAME } from "../core/frameMath";
 import type { ChunkTiming, PhonemizedChunk } from "../core/types";
 import { framed, type KokoroVocabulary } from "../linguistics/vocabulary";
+import { COMPILE_LABEL } from "../workers/protocol";
 import {
   Calibration,
   distributeFrames,
@@ -26,23 +27,40 @@ import { loadVoice, type Voice } from "./voices";
  * ────────────────────────────────────────────────────────────────────────────
  */
 /**
- * ONNX Runtime's wasm backend defaults to one thread per logical core, and
- * starts them by spawning workers. This code already runs *inside* a worker, so
- * those are nested workers — and on some browser builds that hangs rather than
- * failing: the session never resolves, nothing is thrown, and the import stops
- * partway through loading the model with nothing in the console. It reproduces
- * at any thread count above one, on a machine with 16 GB free, so it is not a
- * memory problem to be tuned around.
+ * True only where ONNX Runtime can actually run multi-threaded.
  *
- * So the default here is one thread, which always works. It costs nothing on
- * the path most people are on: `device: "auto"` tries WebGPU first, and WebGPU
- * does not use wasm threads at all. Anyone who wants the multi-threaded CPU
- * backend can raise it in Settings, and `Session.checkForStall` puts it back to
- * one if it hangs.
+ * Its wasm thread pool is built on `SharedArrayBuffer`, which a browser only
+ * hands out to a cross-origin-isolated page — COOP and COEP response headers,
+ * which the dev server and `electron/main.ts` both set precisely for this. Ask
+ * for threads without isolation and the runtime spawns nested workers that
+ * cannot share memory: on some builds that hangs rather than failing, the
+ * session never resolves, and the import stops partway through the model load
+ * with nothing in the console.
+ *
+ * So the thread count is gated on the one signal that actually predicts it
+ * rather than being pinned to one everywhere. Pinning it to one was safe, but
+ * it also meant the local server the desktop build exists to run — its entire
+ * stated purpose is these two headers — bought nothing, and CPU synthesis ran
+ * about four times slower than the machine could manage.
  */
+function isCrossOriginIsolated(): boolean {
+  const global = globalThis as { crossOriginIsolated?: boolean };
+  return global.crossOriginIsolated === true && typeof SharedArrayBuffer !== "undefined";
+}
+
+/**
+ * Cores minus one, capped at four. The cap is deliberate: past four threads
+ * Kokoro's graph stops scaling and the extra workers just contend, and leaving
+ * a core free keeps extraction and the highlight responsive while Phase B runs.
+ */
+export function defaultThreadCount(cores: number, isolated = isCrossOriginIsolated()): number {
+  if (!isolated) return 1;
+  return Math.max(1, Math.min(4, cores - 1));
+}
+
 function configureRuntime(threads?: number): void {
   const cores = typeof navigator !== "undefined" ? (navigator.hardwareConcurrency ?? 2) : 2;
-  ort.env.wasm.numThreads = Math.max(1, Math.min(threads ?? 1, cores));
+  ort.env.wasm.numThreads = Math.max(1, Math.min(threads ?? defaultThreadCount(cores), cores));
   // Nothing here needs a proxy worker: this already *is* a worker.
   ort.env.wasm.proxy = false;
   ort.env.logLevel = "error";
@@ -74,6 +92,25 @@ export interface KokoroEngineConfig {
 
 export type LoadProgress = (label: string, loaded: number, total: number) => void;
 
+export interface LoadHooks {
+  onProgress?: LoadProgress;
+  /**
+   * Awaited between fetching the model and compiling it.
+   *
+   * The fetch is network I/O and overlaps anything; the compile is one
+   * uninterruptible call into WebAssembly that owns this thread for as long as
+   * it takes. Whoever else is using the thread gets to say when that is a good
+   * moment.
+   */
+  beforeCompile?: () => Promise<void>;
+  /**
+   * Called when a provider compiled the graph but could not run it, before the
+   * next one is tried. Falling from WebGPU to WASM is roughly a tenfold
+   * slowdown, which is worth saying out loud rather than discovering.
+   */
+  onProviderRejected?: (provider: string, reason: string) => void;
+}
+
 interface SessionIO {
   tokens: string;
   style: string;
@@ -89,19 +126,24 @@ export interface EngineInfo {
 }
 
 export class KokoroEngine {
-  private readonly model: ort.InferenceSession;
-  private readonly modelIO: SessionIO;
-  private readonly waveformOutput: string;
-  private readonly durationModel?: ort.InferenceSession;
-  private readonly durationIO?: SessionIO;
-  private readonly durationOutput?: string;
+  private model: ort.InferenceSession;
+  private modelIO: SessionIO;
+  private waveformOutput: string;
+  private durationModel?: ort.InferenceSession;
+  private durationIO?: SessionIO;
+  private durationOutput?: string;
   private readonly voice: Voice;
   private readonly vocabulary: KokoroVocabulary;
   private readonly weights: DurationWeights;
+  private readonly config: KokoroEngineConfig;
+  /** Set once the GPU has been abandoned, so the rebuild is attempted once. */
+  private cpuFallback: Promise<boolean> | undefined;
   readonly calibration = new Calibration();
-  readonly device: string;
+  device: string;
   /** Set when a chunk's rendered length disagreed with the duration model. */
   frameCountMismatches = 0;
+  /** Called when a run failure forced the engine onto a different device. */
+  onDeviceChange: ((device: string, reason: string) => void) | undefined;
 
   private constructor(init: {
     model: ort.InferenceSession;
@@ -113,6 +155,7 @@ export class KokoroEngine {
     voice: Voice;
     vocabulary: KokoroVocabulary;
     device: string;
+    config: KokoroEngineConfig;
   }) {
     this.model = init.model;
     this.modelIO = init.modelIO;
@@ -124,17 +167,16 @@ export class KokoroEngine {
     this.vocabulary = init.vocabulary;
     this.weights = new DurationWeights(init.vocabulary);
     this.device = init.device;
+    this.config = init.config;
   }
 
   static async load(
     config: KokoroEngineConfig,
     vocabulary: KokoroVocabulary,
-    onProgress?: LoadProgress,
+    hooks: LoadHooks = {},
   ): Promise<KokoroEngine> {
+    const { onProgress, beforeCompile, onProviderRejected } = hooks;
     configureRuntime(config.threads);
-    const wanted = config.device ?? "auto";
-    const providers: ort.InferenceSession.ExecutionProviderConfig[][] =
-      wanted === "wasm" ? [["wasm"]] : wanted === "webgpu" ? [["webgpu"]] : [["webgpu"], ["wasm"]];
 
     const [modelBytes, durationBytes, voice] = await Promise.all([
       fetchModel(config.modelUrl, "Kokoro model", onProgress),
@@ -144,69 +186,40 @@ export class KokoroEngine {
       loadVoice(config.voiceID, config.voicesBaseUrl),
     ]);
 
-    let model: ort.InferenceSession | undefined;
-    let device = "";
-    let lastError: unknown;
+    await beforeCompile?.();
+
     // Compiling a few hundred megabytes of graph is the longest stretch of the
     // load with nothing to report, so it gets its own label.
-    onProgress?.("Preparing the model", 0, 1);
-    for (const executionProviders of providers) {
-      try {
-        model = await ort.InferenceSession.create(modelBytes, {
-          executionProviders,
-          graphOptimizationLevel: "all",
-        });
-        device = String(executionProviders[0]);
-        break;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    if (!model) {
-      throw new PolyReadError("modelMissing", `no execution provider accepted the model: ${String(lastError)}`);
-    }
+    onProgress?.(COMPILE_LABEL, 0, 1);
+    const main = await createWaveformSession(
+      modelBytes,
+      providersFor(config.device),
+      config,
+      vocabulary,
+      voice,
+      onProviderRejected,
+    );
 
-    const modelIO = resolveInputs(model, config.modelUrl);
-    const waveformOutput = resolveOutput(model, WAVEFORM_OUTPUT_NAMES, config.modelUrl, "waveform");
-
-    let durationModel: ort.InferenceSession | undefined;
-    let durationIO: SessionIO | undefined;
-    let durationOutput: string | undefined;
-    if (durationBytes) {
-      try {
-        durationModel = await ort.InferenceSession.create(durationBytes, {
-          // The duration subgraph is small and runs once per chunk in Phase A.
-          // WASM is both fast enough and free of GPU warm-up, which matters
-          // because Phase A is the loading bar the user is watching.
-          executionProviders: ["wasm"],
-          graphOptimizationLevel: "all",
-        });
-        durationIO = resolveInputs(durationModel, config.durationModelUrl ?? "duration model");
-        durationOutput = resolveOutput(
-          durationModel,
-          DURATION_OUTPUT_NAMES,
-          config.durationModelUrl ?? "duration model",
-          "duration",
-        );
-      } catch {
-        // A duration model that will not load is a downgrade, not a failure:
-        // the estimated tier still works and says so.
-        durationModel = undefined;
-        durationIO = undefined;
-        durationOutput = undefined;
-      }
-    }
+    // The duration subgraph runs once per chunk and shares the acoustic model's
+    // device. It used to be pinned to WASM on the grounds that it is small and
+    // has no GPU warm-up — but "small" here is most of Kokoro's text encoder,
+    // and single-threaded WASM turned §7.2 into several minutes of loading bar
+    // on a machine whose GPU does the same pass in milliseconds.
+    const duration = durationBytes
+      ? await createDurationSession(durationBytes, main.device, config, vocabulary, voice)
+      : undefined;
 
     return new KokoroEngine({
-      model,
-      modelIO,
-      waveformOutput,
-      durationModel,
-      durationIO,
-      durationOutput,
+      model: main.session,
+      modelIO: main.io,
+      waveformOutput: main.output,
+      durationModel: duration?.session,
+      durationIO: duration?.io,
+      durationOutput: duration?.output,
       voice,
       vocabulary,
-      device,
+      device: main.device,
+      config,
     });
   }
 
@@ -253,9 +266,7 @@ export class KokoroEngine {
   async durations(chunk: PhonemizedChunk): Promise<ChunkTiming> {
     const tokens = framed(chunk.tokens);
     if (this.durationModel && this.durationIO && this.durationOutput) {
-      const results = await this.durationModel.run(
-        this.feeds(tokens, chunk.tokens.length, this.durationIO),
-      );
+      const results = await this.run("duration", tokens, chunk.tokens.length);
       const raw = results[this.durationOutput];
       if (!raw) {
         throw new PolyReadError("modelShapeMismatch", `duration model returned no "${this.durationOutput}"`);
@@ -272,6 +283,20 @@ export class KokoroEngine {
       return { chunkID: chunk.id, frameDurations: roundedFramesAll(values), source: "model" };
     }
 
+    return this.estimate(chunk);
+  }
+
+  /** True when §7.2's exact tier is available at all. */
+  get hasDurationModel(): boolean {
+    return this.durationModel !== undefined;
+  }
+
+  /**
+   * The phoneme-class estimate on its own — no inference, no await that does
+   * any work. Phase A opens the reader on these and refines them afterwards.
+   */
+  estimate(chunk: PhonemizedChunk): ChunkTiming {
+    const tokens = framed(chunk.tokens);
     const total = estimateChunkFrames(tokens, this.weights, this.calibration);
     return {
       chunkID: chunk.id,
@@ -288,7 +313,7 @@ export class KokoroEngine {
     timing: ChunkTiming;
   }> {
     const tokens = framed(chunk.tokens);
-    const results = await this.model.run(this.feeds(tokens, chunk.tokens.length, this.modelIO));
+    const results = await this.run("waveform", tokens, chunk.tokens.length);
     const raw = results[this.waveformOutput];
     if (!raw) {
       throw new PolyReadError("modelShapeMismatch", `model returned no "${this.waveformOutput}"`);
@@ -317,23 +342,93 @@ export class KokoroEngine {
     return { samples, timing: { chunkID: chunk.id, frameDurations, source: "estimated" } };
   }
 
-  private feeds(
+  /**
+   * One inference, with the GPU escape hatch.
+   *
+   * A WebGPU session that *creates* successfully can still fail on every run:
+   * the shaders for individual operators are compiled lazily, per op and dtype,
+   * so a driver that will not accept one of them surfaces as
+   * `Failed to create a WebGPU compute pipeline` from `OrtRun` rather than from
+   * session creation. `load` smoke-tests the graph for exactly this reason, but
+   * a pipeline that only fails at some shapes would slip past it — and the way
+   * that used to present was the worst available: Phase B died on its first
+   * chunk, the transport sat on "rendering this passage" forever, and the
+   * benchmark screen would not run at all. So a run failure on the GPU rebuilds
+   * the session on the CPU and retries, once.
+   */
+  private async run(
+    which: "waveform" | "duration",
     tokens: readonly number[],
     phonemeCount: number,
-    io: SessionIO,
-  ): Record<string, ort.Tensor> {
-    const style = this.voice.style(phonemeCount);
-    const feeds: Record<string, ort.Tensor> = {
-      [io.tokens]: io.tokensAreInt64
-        ? new ort.Tensor("int64", BigInt64Array.from(tokens, BigInt), [1, tokens.length])
-        : new ort.Tensor("int32", Int32Array.from(tokens), [1, tokens.length]),
-      [io.style]: new ort.Tensor("float32", style, [1, style.length]),
-    };
-    // §8.2 — "**Do not** follow the card's advice to divide durations by speed
-    // at synthesis". Speed is a playback-time stretch, so the model always runs
-    // at 1.0 and a speed change never invalidates a cached chunk.
-    if (io.speed) feeds[io.speed] = new ort.Tensor("float32", Float32Array.from([1]), [1]);
-    return feeds;
+  ): Promise<ort.InferenceSession.OnnxValueMapType> {
+    const session = (): { session: ort.InferenceSession; io: SessionIO } =>
+      which === "duration" && this.durationModel && this.durationIO
+        ? { session: this.durationModel, io: this.durationIO }
+        : { session: this.model, io: this.modelIO };
+
+    const first = session();
+    try {
+      return await first.session.run(buildFeeds(tokens, this.voice.style(phonemeCount), first.io));
+    } catch (error) {
+      // Only the acoustic model is worth moving the whole engine for. A duration
+      // subgraph that will not run is §7.2's exact tier going away, which the
+      // coordinator already treats as a downgrade to the estimate.
+      if (which !== "waveform") throw error;
+      if (!(await this.fallBackToCpu(error))) throw error;
+      const retry = session();
+      return await retry.session.run(buildFeeds(tokens, this.voice.style(phonemeCount), retry.io));
+    }
+  }
+
+  /**
+   * Rebuilds both sessions on the WASM backend after a GPU run failed. Returns
+   * false when there is nothing left to fall back to, in which case the caller
+   * rethrows the original error.
+   */
+  private fallBackToCpu(error: unknown): Promise<boolean> {
+    if (this.device === "wasm") return Promise.resolve(false);
+    if (this.cpuFallback) return this.cpuFallback;
+
+    const reason = error instanceof Error ? error.message : String(error);
+    this.cpuFallback = (async () => {
+      const previous = { model: this.model, duration: this.durationModel };
+      try {
+        const modelBytes = await fetchModel(this.config.modelUrl, "Kokoro model");
+        const main = await createWaveformSession(
+          modelBytes,
+          [["wasm"]],
+          this.config,
+          this.vocabulary,
+          this.voice,
+        );
+        this.model = main.session;
+        this.modelIO = main.io;
+        this.waveformOutput = main.output;
+        this.device = main.device;
+
+        if (this.config.durationModelUrl && this.durationModel) {
+          const durationBytes = await fetchModel(this.config.durationModelUrl, "Duration model").catch(
+            () => undefined,
+          );
+          const duration = durationBytes
+            ? await createDurationSession(durationBytes, "wasm", this.config, this.vocabulary, this.voice)
+            : undefined;
+          this.durationModel = duration?.session;
+          this.durationIO = duration?.io;
+          this.durationOutput = duration?.output;
+        }
+      } catch {
+        return false;
+      }
+      await previous.model.release?.().catch(() => undefined);
+      if (previous.duration !== this.durationModel) {
+        await previous.duration?.release?.().catch(() => undefined);
+      }
+      this.onDeviceChange?.(this.device, reason);
+      return true;
+    })();
+
+    return this.cpuFallback;
   }
 
   async dispose(): Promise<void> {
@@ -426,6 +521,141 @@ function distributeSegment(frames: readonly number[], target: number): number[] 
 }
 
 // MARK: - Session plumbing
+
+function providersFor(device: KokoroEngineConfig["device"]): ort.InferenceSession.ExecutionProviderConfig[][] {
+  const wanted = device ?? "auto";
+  if (wanted === "wasm") return [["wasm"]];
+  if (wanted === "webgpu") return [["webgpu"]];
+  return [["webgpu"], ["wasm"]];
+}
+
+interface ResolvedSession {
+  session: ort.InferenceSession;
+  io: SessionIO;
+  output: string;
+  device: string;
+}
+
+/**
+ * Creates the acoustic session on the first provider that both compiles the
+ * graph *and* runs it.
+ *
+ * The second half is the part that was missing. `InferenceSession.create`
+ * succeeding means the graph parsed and the weights uploaded; it says nothing
+ * about whether the driver will compile the shaders each operator needs, which
+ * WebGPU only finds out at the first run. On the machine this was reported from
+ * that first run came back with
+ * `Failed to create a WebGPU compute pipeline: ShaderModule with 'Clip' label
+ * is invalid` — after the app had already said "voice ready", so every symptom
+ * landed minutes later and somewhere else. One throwaway inference here turns
+ * that into a provider that is simply not chosen.
+ */
+async function createWaveformSession(
+  bytes: Uint8Array,
+  providers: ort.InferenceSession.ExecutionProviderConfig[][],
+  config: KokoroEngineConfig,
+  vocabulary: KokoroVocabulary,
+  voice: Voice,
+  onRejected?: (provider: string, reason: string) => void,
+): Promise<ResolvedSession> {
+  let lastError: unknown;
+  for (const executionProviders of providers) {
+    const name = String(executionProviders[0]);
+    let session: ort.InferenceSession | undefined;
+    try {
+      session = await ort.InferenceSession.create(bytes, {
+        executionProviders,
+        graphOptimizationLevel: "all",
+      });
+      const io = resolveInputs(session, config.modelUrl);
+      const output = resolveOutput(session, WAVEFORM_OUTPUT_NAMES, config.modelUrl, "waveform");
+      await smokeTest(session, io, output, vocabulary, voice);
+      return { session, io, output, device: name };
+    } catch (error) {
+      lastError = error;
+      onRejected?.(name, error instanceof Error ? error.message : String(error));
+      await session?.release?.().catch(() => undefined);
+    }
+  }
+  throw new PolyReadError(
+    "modelMissing",
+    `no execution provider could run the model: ${String(lastError)}`,
+  );
+}
+
+async function createDurationSession(
+  bytes: Uint8Array,
+  device: string,
+  config: KokoroEngineConfig,
+  vocabulary: KokoroVocabulary,
+  voice: Voice,
+): Promise<ResolvedSession | undefined> {
+  const label = config.durationModelUrl ?? "duration model";
+  // The acoustic model has already proven this device works; try it here, and
+  // keep WASM as the backstop so a subgraph the GPU dislikes is a downgrade
+  // rather than a lost tier.
+  const providers: ort.InferenceSession.ExecutionProviderConfig[][] =
+    device === "wasm" ? [["wasm"]] : [[device], ["wasm"]];
+
+  for (const executionProviders of providers) {
+    let session: ort.InferenceSession | undefined;
+    try {
+      session = await ort.InferenceSession.create(bytes, {
+        executionProviders,
+        graphOptimizationLevel: "all",
+      });
+      const io = resolveInputs(session, label);
+      const output = resolveOutput(session, DURATION_OUTPUT_NAMES, label, "duration");
+      await smokeTest(session, io, output, vocabulary, voice);
+      return { session, io, output, device: String(executionProviders[0]) };
+    } catch {
+      await session?.release?.().catch(() => undefined);
+    }
+  }
+  // A duration model that will not load is a downgrade, not a failure: the
+  // estimated tier still works and says so.
+  return undefined;
+}
+
+/** A handful of real phoneme ids, so the smoke run exercises the whole graph. */
+function smokeTokens(vocabulary: KokoroVocabulary): number[] {
+  const { tokens } = vocabulary.encode("hɐlˈoʊ");
+  if (tokens.length > 0) return tokens;
+  return [...vocabulary.symbolToID.values()].filter((id) => id > 0).slice(0, 4);
+}
+
+async function smokeTest(
+  session: ort.InferenceSession,
+  io: SessionIO,
+  output: string,
+  vocabulary: KokoroVocabulary,
+  voice: Voice,
+): Promise<void> {
+  const ids = smokeTokens(vocabulary);
+  const tokens = framed(ids);
+  const results = await session.run(buildFeeds(tokens, voice.style(ids.length), io));
+  if (!results[output]) {
+    throw new PolyReadError("modelShapeMismatch", `model returned no "${output}"`);
+  }
+}
+
+function buildFeeds(
+  tokens: readonly number[],
+  style: Float32Array,
+  io: SessionIO,
+): Record<string, ort.Tensor> {
+  const feeds: Record<string, ort.Tensor> = {
+    [io.tokens]: io.tokensAreInt64
+      ? new ort.Tensor("int64", BigInt64Array.from(tokens, BigInt), [1, tokens.length])
+      : new ort.Tensor("int32", Int32Array.from(tokens), [1, tokens.length]),
+    [io.style]: new ort.Tensor("float32", style, [1, style.length]),
+  };
+  // §8.2 — "**Do not** follow the card's advice to divide durations by speed
+  // at synthesis". Speed is a playback-time stretch, so the model always runs
+  // at 1.0 and a speed change never invalidates a cached chunk.
+  if (io.speed) feeds[io.speed] = new ort.Tensor("float32", Float32Array.from([1]), [1]);
+  return feeds;
+}
 
 function describeMeta(meta: ort.InferenceSession.ValueMetadata): string {
   if (!meta.isTensor) return "non-tensor";

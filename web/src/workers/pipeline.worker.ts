@@ -17,7 +17,7 @@ import type { PdfDocumentProxy, PdfLoadingTask } from "../extraction/pdfTypes";
 import type { BackendDecision } from "../extraction/quality";
 import { EspeakPhonemizer } from "../linguistics/espeakPhonemizer";
 import { LinguisticsPipeline } from "../linguistics/pipeline";
-import { assertVocabularyShape, loadVocabulary } from "../linguistics/vocabulary";
+import { assertVocabularyShape, loadVocabulary, type KokoroVocabulary } from "../linguistics/vocabulary";
 import { unencodableEntries } from "../linguistics/homographs";
 import { SynthesisCoordinator, type CoordinatorEvent } from "../synthesis/coordinator";
 import { KokoroEngine } from "../synthesis/kokoroEngine";
@@ -48,6 +48,16 @@ const emit = (event: CoordinatorEvent): void => {
     case "phaseA":
       post({ type: "stage", stage: "Timing the document", done: event.done, total: event.total });
       break;
+    case "timeline":
+      post({
+        type: "timeline",
+        words: event.words,
+        duration: event.duration,
+        chunkFrameOffsets: event.chunkFrameOffsets,
+        footnoteTimelines: event.footnoteTimelines,
+      });
+      schedulePersist();
+      break;
     case "priming":
       post({ type: "priming", seconds: event.seconds, target: event.target });
       break;
@@ -58,17 +68,11 @@ const emit = (event: CoordinatorEvent): void => {
         renderedThrough: event.renderedThrough,
         totalChunks: event.totalChunks,
       });
-      break;
-    case "timeline":
-      post({
-        type: "timeline",
-        words: event.words,
-        duration: event.duration,
-        chunkFrameOffsets: event.chunkFrameOffsets,
-      });
+      schedulePersist();
       break;
     case "complete":
       post({ type: "renderComplete" });
+      void persistProgress();
       break;
     case "failed":
       post({ type: "error", message: event.message });
@@ -77,15 +81,49 @@ const emit = (event: CoordinatorEvent): void => {
 };
 
 /**
+ * Opening a document holds the model's compile back until the reader is up.
+ *
+ * Extraction, §6 and §7.2 all run on this thread, and so does
+ * `InferenceSession.create` — which is one blocking call into WebAssembly that
+ * does not yield for as long as it takes to compile Kokoro's graph. Starting it
+ * early was supposed to overlap it with reading the PDF; what actually
+ * overlapped was the *download*, and the compile then sat in front of
+ * extraction with the thread to itself. Nothing before Phase B needs the model,
+ * so the compile waits for a document that is on its way in, and the reader
+ * opens while it runs afterwards.
+ */
+let readerOpen: Promise<void> = Promise.resolve();
+let openReader: () => void = () => undefined;
+
+/**
+ * Holds the compile and returns the release. Every caller releases it in a
+ * `finally`: a hold that is never released is a model that never compiles, so
+ * an import that fails, or one the user cancels at the §4.2 confirmation, must
+ * not be able to leave the gate shut.
+ */
+function holdCompileUntilReaderOpens(): () => void {
+  const previous = openReader;
+  let released = false;
+  readerOpen = new Promise<void>((resolve) => {
+    openReader = () => {
+      released = true;
+      resolve();
+    };
+  });
+  previous();
+  const release = openReader;
+  return () => {
+    if (!released) release();
+  };
+}
+
+/**
  * Loads the voice model, once, and hands every caller the same load.
  *
- * The model is a few hundred megabytes to fetch and compile, and it used to be
- * started here — after extraction, after the phonemizer, at the point Phase A
- * needed it. Everything before it was therefore dead time on a machine that
- * could have been downloading, and the user's first sign that anything was
- * happening at all came minutes in. `warmEngine` starts this the moment the
- * worker is configured, so the load overlaps with reading the PDF instead of
- * queueing behind it.
+ * The model is a few hundred megabytes to fetch and compile. The fetch starts
+ * the moment the worker is configured — it is network I/O and genuinely
+ * overlaps everything — and the compile takes the thread when nothing is
+ * waiting for the screen.
  */
 function ensureEngine(): Promise<KokoroEngine> {
   if (engine) return Promise.resolve(engine);
@@ -108,7 +146,16 @@ function ensureEngine(): Promise<KokoroEngine> {
         threads: configured.threads > 0 ? configured.threads : undefined,
       },
       vocabulary,
-      (label, done, total) => post({ type: "model", phase: "loading", label, done, total }),
+      {
+        onProgress: (label, done, total) => post({ type: "model", phase: "loading", label, done, total }),
+        beforeCompile: () => readerOpen,
+        onProviderRejected: (provider, reason) =>
+          post({
+            type: "error",
+            kind: "deviceFallback",
+            message: `${provider} compiled the voice model but could not run it, so it is not being used: ${reason}`,
+          }),
+      },
     );
     engine = loaded;
     post({ type: "model", phase: "ready", label: loaded.device, done: 1, total: 1 });
@@ -157,11 +204,27 @@ async function openPdf(bytes: ArrayBuffer): Promise<OpenPdf> {
 }
 
 async function runImport(bytes: ArrayBuffer, fileName: string, allowOcr: boolean): Promise<void> {
-  // Started before anything else and awaited at the last possible moment, so
-  // the download and the graph compile run underneath extraction rather than
-  // after it.
+  const releaseCompile = holdCompileUntilReaderOpens();
+  try {
+    await importDocument(bytes, fileName, allowOcr, releaseCompile);
+  } finally {
+    releaseCompile();
+  }
+}
+
+async function importDocument(
+  bytes: ArrayBuffer,
+  fileName: string,
+  allowOcr: boolean,
+  releaseCompile: () => void,
+): Promise<void> {
+  // Whatever was rendering is not what the user is looking at any more, and it
+  // is competing for the same thread as the import that replaced it.
+  coordinator?.cancel();
+  // Started before anything else and handed to Phase B, which is the first
+  // thing that actually needs it. The reader opens without it.
   const engineReady = ensureEngine();
-  // Nothing awaits this until Phase A; without a handler an early rejection is
+  // Nothing awaits this until Phase B; without a handler an early rejection is
   // an unhandled one.
   engineReady.catch(() => undefined);
 
@@ -186,6 +249,9 @@ async function runImport(bytes: ArrayBuffer, fileName: string, allowOcr: boolean
   let decision: BackendDecision = await surveyDocument(document, { allowOcr });
   if (decision.needsUserConfirmation) {
     post({ type: "needsConfirmation", decision });
+    // Nothing is going to reach the screen until a person answers, so the
+    // compile may as well have the thread.
+    releaseCompile();
     const proceed = await new Promise<boolean>((resolve) => {
       confirmResolver = resolve;
     });
@@ -208,13 +274,8 @@ async function runImport(bytes: ArrayBuffer, fileName: string, allowOcr: boolean
     post({ type: "stage", stage: "Reading it out to itself", done, total }),
   );
 
-  post({ type: "stage", stage: "Waiting for the voice model", done: 0, total: 1 });
-  const kokoro = await engineReady;
   coordinator?.cancel();
-  coordinator = new SynthesisCoordinator(kokoro, {
-    initialAudioLead: settings?.initialAudioLead ?? DEFAULT_AUDIO_LEAD,
-    onAudio: (chunkIndex, samples) => store.putAudio(hash, chunkIndex, samples),
-  });
+  coordinator = newCoordinator(hash, await vocabularyForSettings());
 
   const phaseA = await coordinator.runPhaseA(
     analysed.mainChunks,
@@ -223,27 +284,27 @@ async function runImport(bytes: ArrayBuffer, fileName: string, allowOcr: boolean
     emit,
   );
 
-  const sidecar: DocumentSidecar = {
-    version: SIDECAR_VERSION,
-    contentHash: hash,
-    title: extraction.title,
-    pageCount: extraction.pageCount,
-    voiceName: settings?.voiceID ?? "af_heart",
-    timingSource: phaseA.timingSource,
-    blocks: analysed.blocks,
-    words: phaseA.words,
-    mainChunks: analysed.mainChunks,
-    footnoteChunks: analysed.footnoteChunks,
-    chunkTimings: coordinator.chunkTimings,
-    reflow: analysed.reflow,
-    footnoteTimelines: phaseA.footnoteTimelines,
-    chunkFrameOffsets: phaseA.chunkFrameOffsets,
-    createdAt: Date.now(),
+  current = {
+    hash,
+    coordinator,
+    sidecar: {
+      version: SIDECAR_VERSION,
+      contentHash: hash,
+      title: extraction.title,
+      pageCount: extraction.pageCount,
+      voiceName: settings?.voiceID ?? "af_heart",
+      timingSource: phaseA.timingSource,
+      blocks: analysed.blocks,
+      words: phaseA.words,
+      mainChunks: analysed.mainChunks,
+      footnoteChunks: analysed.footnoteChunks,
+      chunkTimings: coordinator.chunkTimings,
+      reflow: analysed.reflow,
+      footnoteTimelines: phaseA.footnoteTimelines,
+      chunkFrameOffsets: phaseA.chunkFrameOffsets,
+      createdAt: Date.now(),
+    },
   };
-
-  await persist(sidecar, analysed.mainChunks.length, phaseA.duration);
-  await store.putOriginal(hash, bytes);
-  await store.evictToFit(settings?.cacheCapBytes ?? 4 * 1024 ** 3, hash);
 
   post({
     type: "ready",
@@ -262,11 +323,102 @@ async function runImport(bytes: ArrayBuffer, fileName: string, allowOcr: boolean
       decision,
       diagnostics: diagnostics(extraction.invariantViolations, analysed),
     },
-    engine: kokoro.info,
+    engine: engine?.info,
   });
 
   await release();
-  void coordinator.startPhaseB(emit);
+  releaseCompile();
+
+  // After the reader, not before it: writing a few megabytes of PDF and a
+  // sidecar into IndexedDB is not something anyone should be watching a
+  // loading bar for.
+  await persist(current.sidecar, analysed.mainChunks.length, phaseA.duration);
+  await store.putOriginal(hash, bytes);
+  await store.evictToFit(settings?.cacheCapBytes ?? 4 * 1024 ** 3, hash);
+  post({ type: "library", entries: await store.list() });
+
+  await startSynthesis(coordinator, engineReady);
+}
+
+/**
+ * The document currently open, kept so Phase B's real frame counts can be
+ * written back.
+ *
+ * Without this the sidecar holds Phase A's numbers forever: reopening a
+ * half-rendered document replayed estimates against audio whose true lengths
+ * were already on disk, and every chunk after the first rendered one sat at the
+ * wrong offset — §5's "the bug will look like a timing bug", exactly.
+ */
+let current: { hash: string; sidecar: DocumentSidecar; coordinator: SynthesisCoordinator } | undefined;
+let persistTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** How often the sidecar is rewritten while Phase B runs. */
+const PERSIST_INTERVAL_MS = 20_000;
+
+function newCoordinator(hash: string, vocabulary: KokoroVocabulary): SynthesisCoordinator {
+  return new SynthesisCoordinator({
+    initialAudioLead: settings?.initialAudioLead ?? DEFAULT_AUDIO_LEAD,
+    vocabulary,
+    onAudio: (chunkIndex, samples) => store.putAudio(hash, chunkIndex, samples),
+  });
+}
+
+function schedulePersist(): void {
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = undefined;
+    void persistProgress();
+  }, PERSIST_INTERVAL_MS);
+}
+
+async function persistProgress(): Promise<void> {
+  const open = current;
+  // Paired with its own coordinator, not with whatever is current: an import
+  // started while the last document was still rendering would otherwise write
+  // one document's timings into the other's sidecar.
+  if (!open || open.coordinator !== coordinator) return;
+  const sidecar = open.sidecar;
+  sidecar.chunkTimings = open.coordinator.chunkTimings;
+  sidecar.chunkFrameOffsets = open.coordinator.progress.chunkFrameOffsets;
+  sidecar.timingSource = open.coordinator.timingSource;
+  try {
+    await persist(sidecar, open.coordinator.totalChunks, open.coordinator.duration);
+  } catch {
+    // A cache that will not take a write is not a reason to stop rendering.
+  }
+}
+
+/**
+ * Hands the coordinator its engine once the model is up, then starts Phase B.
+ *
+ * Separated from the import so that everything before it — extraction, §6, and
+ * §7.2's estimated timeline — has already reached the screen.
+ */
+async function startSynthesis(
+  target: SynthesisCoordinator,
+  engineReady: Promise<KokoroEngine>,
+): Promise<void> {
+  let kokoro: KokoroEngine;
+  try {
+    kokoro = await engineReady;
+  } catch {
+    // `ensureEngine` has already posted the failure, and the library explains
+    // what to run. The reader still works; it just cannot speak.
+    return;
+  }
+  if (coordinator !== target) return;
+  kokoro.onDeviceChange = (device, reason) => {
+    post({ type: "model", phase: "ready", label: device, done: 1, total: 1 });
+    post({ type: "engine", info: kokoro.info });
+    post({
+      type: "error",
+      message: `The GPU could not run the voice model, so it moved to the CPU: ${reason}`,
+      kind: "deviceFallback",
+    });
+  };
+  target.attachEngine(kokoro);
+  post({ type: "engine", info: kokoro.info });
+  await target.startPhaseB(emit);
 }
 
 async function resume(
@@ -274,12 +426,24 @@ async function resume(
   sidecar: DocumentSidecar,
   engineReady: Promise<KokoroEngine> = ensureEngine(),
 ): Promise<void> {
-  const kokoro = await engineReady;
+  engineReady.catch(() => undefined);
+  const releaseCompile = holdCompileUntilReaderOpens();
+  try {
+    await replaySidecar(hash, sidecar, engineReady, releaseCompile);
+  } finally {
+    releaseCompile();
+  }
+}
+
+async function replaySidecar(
+  hash: string,
+  sidecar: DocumentSidecar,
+  engineReady: Promise<KokoroEngine>,
+  releaseCompile: () => void,
+): Promise<void> {
   coordinator?.cancel();
-  coordinator = new SynthesisCoordinator(kokoro, {
-    initialAudioLead: settings?.initialAudioLead ?? DEFAULT_AUDIO_LEAD,
-    onAudio: (chunkIndex, samples) => store.putAudio(hash, chunkIndex, samples),
-  });
+  coordinator = newCoordinator(hash, await vocabularyForSettings());
+  current = { hash, sidecar, coordinator };
 
   // Phase A's work is in the sidecar, so this replays it rather than paying for
   // it again — §7.4's "reopening a document is instant".
@@ -290,9 +454,20 @@ async function resume(
     emit,
     sidecar.chunkTimings,
   );
-  const rendered = await store.renderedChunkIndices(hash);
-  coordinator.adoptRendered(rendered);
+  // The real lengths of what is already on disk, so the replayed timeline lines
+  // up with the audio it is describing rather than with Phase A's guess at it.
+  const rendered = await store.renderedChunks(hash);
+  coordinator.adoptRendered(
+    rendered.map((chunk) => chunk.index),
+    new Map(rendered.map((chunk) => [chunk.index, chunk.frames])),
+  );
   await store.touch(hash);
+
+  // After `adoptRendered`, not from Phase A's return value: adopting moves the
+  // layout to the real lengths of the audio on disk, and posting Phase A's
+  // words alongside the moved offsets would put the highlight and the audio in
+  // different places from the first frame.
+  const timeline = coordinator.snapshot();
 
   post({
     type: "ready",
@@ -302,26 +477,34 @@ async function resume(
       pageCount: sidecar.pageCount,
       blocks: sidecar.blocks,
       reflow: sidecar.reflow,
-      words: phaseA.words,
+      words: timeline.words,
       footnoteTimelines: phaseA.footnoteTimelines,
-      chunkFrameOffsets: phaseA.chunkFrameOffsets,
-      duration: phaseA.duration,
-      timingSource: sidecar.timingSource,
+      chunkFrameOffsets: timeline.chunkFrameOffsets,
+      duration: timeline.duration,
+      timingSource: phaseA.timingSource,
       voiceID: sidecar.voiceName,
       diagnostics: [],
     },
-    engine: kokoro.info,
+    engine: engine?.info,
   });
 
-  for (const index of rendered) {
+  for (const chunk of rendered) {
     post({
       type: "rendered",
-      chunkIndex: index,
+      chunkIndex: chunk.index,
       renderedThrough: coordinator.progress.renderedThrough,
       totalChunks: coordinator.progress.totalChunks,
     });
   }
-  void coordinator.startPhaseB(emit);
+  releaseCompile();
+  await startSynthesis(coordinator, engineReady);
+}
+
+/** The vocabulary Phase A's estimates index into; cached across documents. */
+let vocabularyPromise: Promise<KokoroVocabulary> | undefined;
+function vocabularyForSettings(): Promise<KokoroVocabulary> {
+  if (!vocabularyPromise) vocabularyPromise = loadVocabulary(settings?.vocabUrl);
+  return vocabularyPromise;
 }
 
 async function persist(sidecar: DocumentSidecar, totalChunks: number, duration: number): Promise<void> {
@@ -417,27 +600,51 @@ async function benchmark(): Promise<string> {
       if (ids.length >= 480) break;
     }
   }
+  const chunkTokens = ids.slice(0, 480);
   const chunk = {
     id: "benchmark",
     blockID: "benchmark",
-    tokens: ids.slice(0, 480),
-    wordPhonemeRanges: [{ start: 0, end: ids.length }],
+    tokens: chunkTokens,
+    wordPhonemeRanges: [{ start: 0, end: chunkTokens.length }],
     spanOffset: 0,
   };
 
-  await kokoro.render(chunk); // warm-up, to absorb first-prediction compilation
+  // The warm-up absorbs first-prediction compilation, and on WebGPU it is also
+  // where a driver that cannot compile one of Kokoro's shaders declares itself.
+  post({ type: "stage", stage: "Benchmark: warming up", done: 0, total: 1 });
+  await kokoro.render(chunk);
+
+  // §0.1 asks for 60 s of audio. On the CPU backend that can be several minutes
+  // of wall clock, during which nothing reached the UI — long enough for the
+  // stall watchdog to restart the worker underneath it, which is why the
+  // benchmark appeared not to run at all. So it is bounded by elapsed time as
+  // well as by audio, and reports which bound it hit.
+  const BUDGET_SECONDS = 30;
   let renderedSeconds = 0;
   const started = performance.now();
   let passes = 0;
+  let elapsed = 0;
   while (renderedSeconds < 60 && passes < 24) {
     const { samples } = await kokoro.render(chunk);
     renderedSeconds += samples.length / 24000;
     passes += 1;
+    elapsed = (performance.now() - started) / 1000;
+    post({
+      type: "stage",
+      stage: `Benchmark: ${renderedSeconds.toFixed(0)} s of audio rendered`,
+      done: Math.min(renderedSeconds, 60),
+      total: 60,
+    });
+    if (elapsed >= BUDGET_SECONDS) break;
   }
-  const elapsed = (performance.now() - started) / 1000;
+  if (elapsed <= 0) elapsed = (performance.now() - started) / 1000;
   lines.push("");
+  lines.push(`Device in use: ${kokoro.device}`);
   lines.push(`§0.1 throughput: ${renderedSeconds.toFixed(1)} s of audio in ${elapsed.toFixed(1)} s`);
   lines.push(`  realtime multiple: ${(renderedSeconds / elapsed).toFixed(1)}x`);
+  if (renderedSeconds < 60) {
+    lines.push(`  stopped at ${BUDGET_SECONDS} s of wall clock rather than the full 60 s of audio.`);
+  }
   if (renderedSeconds / elapsed < 2) {
     lines.push("  below 2x: rendering will not outrun playback, and §7.3's argument inverts.");
   }
@@ -455,8 +662,10 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>): Promise<void> => {
           settings?.voiceID !== message.settings.voiceID ||
           settings?.device !== message.settings.device ||
           settings?.threads !== message.settings.threads;
+        const vocabChanged = settings?.vocabUrl !== message.settings.vocabUrl;
         settings = message.settings;
         pdfAssetBase = message.pdfAssetBase;
+        if (vocabChanged) vocabularyPromise = undefined;
         if (changed && engine) {
           await engine.dispose();
           engine = undefined;
@@ -479,6 +688,15 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>): Promise<void> => {
       case "open": {
         const sidecar = await store.getSidecar(message.contentHash);
         if (!sidecar) throw new PolyReadError("extractionProducedNothing", "no cached timeline");
+        // `runImport` has always checked this; opening from the library did
+        // not, so a sidecar written by an older pipeline was replayed against
+        // whatever the current one would have produced.
+        if (sidecar.version !== SIDECAR_VERSION) {
+          throw new PolyReadError(
+            "extractionProducedNothing",
+            "that document was prepared by an older version — open the PDF again",
+          );
+        }
         await resume(message.contentHash, sidecar);
         break;
       }
@@ -503,6 +721,9 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>): Promise<void> => {
       case "cancel":
         coordinator?.cancel();
         coordinator = undefined;
+        current = undefined;
+        if (persistTimer) clearTimeout(persistTimer);
+        persistTimer = undefined;
         break;
     }
   } catch (error) {

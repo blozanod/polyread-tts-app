@@ -8,6 +8,7 @@ import { DocumentStore } from "../synthesis/store";
 import type { LibraryEntry } from "../synthesis/store";
 import type { EngineInfo } from "../synthesis/kokoroEngine";
 import type { BackendDecision } from "../extraction/quality";
+import { COMPILE_LABEL } from "../workers/protocol";
 import type { ImportedDocument, WorkerEvent, WorkerRequest } from "../workers/protocol";
 import type { EngineSettings } from "../workers/protocol";
 import { pdfAssetBase } from "../extraction/pdfAssets";
@@ -101,6 +102,13 @@ export class Session {
   private threadOverride: number | undefined;
   /** Set when starvation paused playback, so the chunk landing can resume it. */
   private resumeWhenRendered = -1;
+  /**
+   * Notes about the engine itself — a rejected execution provider, a fall back
+   * to the CPU. Kept apart from the import's own diagnostics because they
+   * happen before there is a document and would otherwise be replaced by the
+   * `ready` that follows them.
+   */
+  private engineNotes: string[] = [];
 
   constructor(settings: AppSettings) {
     this.settings = settings;
@@ -197,7 +205,7 @@ export class Session {
     if (!working && !loading) return;
     // Every worker message refreshes this, model download progress included, so
     // a load that is merely slow does not trip it. Only a silent one does.
-    if (Date.now() - this.lastEventAt < 60_000) return;
+    if (Date.now() - this.lastEventAt < this.stallTimeout()) return;
 
     if (this.threadOverride === 1) {
       this.reportWorkerFailure("The model would not load.");
@@ -222,6 +230,22 @@ export class Session {
     // `spawnWorker` re-sends configure, which re-warms the engine; an import
     // that was in flight has to be asked for again.
     if (request) this.send(request);
+  }
+
+  /**
+   * How long silence is allowed to last before the worker is presumed hung.
+   *
+   * Compiling Kokoro's graph is one blocking call into WebAssembly: no
+   * messages come out of the worker for its whole duration, and on a modest
+   * machine that is well over a minute. The watchdog read that as the hang it
+   * was written for and restarted the worker mid-compile — which threw the
+   * compile away, started it again, and on a machine slow enough to trip it
+   * once was guaranteed to trip it twice. So the compile gets its own budget.
+   */
+  private stallTimeout(): number {
+    const model = this.state.model;
+    const compiling = model.kind === "loading" && model.label === COMPILE_LABEL;
+    return compiling ? 15 * 60_000 : 60_000;
   }
 
   private reportWorkerFailure(message: string): void {
@@ -287,7 +311,11 @@ export class Session {
               : event.phase === "failed"
                 ? { kind: "failed", message: event.label }
                 : { kind: "loading", label: event.label, done: event.done, total: event.total },
+          // A model that is never going to arrive is not a chunk still being
+          // rendered, and the transport should stop saying it is.
+          ...(event.phase === "failed" ? { waitingForAudio: false } : {}),
         });
+        if (event.phase === "failed") this.resumeWhenRendered = -1;
         break;
 
       case "priming":
@@ -298,6 +326,10 @@ export class Session {
         this.patch({ status: { kind: "confirm", decision: event.decision } });
         break;
 
+      case "engine":
+        this.patch({ engine: event.info });
+        break;
+
       case "ready": {
         this.lastRequest = undefined;
         this.timeline = new Timeline(event.document.words);
@@ -306,9 +338,9 @@ export class Session {
         this.patch({
           status: { kind: "ready" },
           document: event.document,
-          engine: event.engine,
+          engine: event.engine ?? this.state.engine,
           duration: event.document.duration,
-          diagnostics: event.document.diagnostics,
+          diagnostics: [...this.engineNotes, ...event.document.diagnostics],
           renderedThrough: 0,
           renderComplete: false,
           priming: undefined,
@@ -341,7 +373,13 @@ export class Session {
         this.patch({
           duration: event.duration,
           document: this.state.document
-            ? { ...this.state.document, words: event.words, duration: event.duration }
+            ? {
+                ...this.state.document,
+                words: event.words,
+                duration: event.duration,
+                footnoteTimelines:
+                  event.footnoteTimelines ?? this.state.document.footnoteTimelines,
+              }
             : undefined,
         });
         break;
@@ -367,8 +405,27 @@ export class Session {
         this.patch({ benchmark: event.report, status: { kind: "ready" } });
         break;
 
-      case "error":
+      case "error": {
+        // Playback parks itself on a chunk being rendered and waits for the
+        // `rendered` event to start it again. When the render is what failed,
+        // that event never comes: the transport sat on "playback resumes on its
+        // own" for as long as anyone was willing to watch it.
+        // A device fallback is news, not a dead end — the engine has already
+        // rebuilt itself elsewhere, the chunk that tripped it is being retried,
+        // and playback still resumes when it lands. It belongs in the notes
+        // beside the import, not under a "something went wrong" heading over a
+        // reader that is working.
+        if (event.kind === "deviceFallback") {
+          if (!this.engineNotes.includes(event.message)) this.engineNotes.push(event.message);
+          this.patch({
+            diagnostics: [...this.engineNotes, ...(this.state.document?.diagnostics ?? [])],
+          });
+          break;
+        }
+        this.pendingOnDemand = -1;
+        this.resumeWhenRendered = -1;
         this.patch({
+          waitingForAudio: false,
           status: {
             kind: "error",
             message: event.message,
@@ -376,6 +433,7 @@ export class Session {
           },
         });
         break;
+      }
     }
   }
 
