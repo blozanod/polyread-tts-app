@@ -6,7 +6,7 @@ import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
 import { tokensOf, violations } from "../src/core/spanInvariant";
 import { buildTimeline, StreamLayout } from "../src/synthesis/streamLayout";
 import { extractDocument, surveyDocument } from "../src/extraction/documentExtractor";
-import type { PdfDocumentProxy } from "../src/extraction/pdfTypes";
+import type { PdfDocumentProxy, PdfLoadingTask } from "../src/extraction/pdfTypes";
 import { EspeakPhonemizer } from "../src/linguistics/espeakPhonemizer";
 import { LinguisticsPipeline } from "../src/linguistics/pipeline";
 import { defaultVocabulary, framed } from "../src/linguistics/vocabulary";
@@ -31,14 +31,15 @@ import type { ChunkTiming } from "../src/core/types";
  */
 const fixture = fileURLToPath(new URL("./fixtures/sample.pdf", import.meta.url));
 
-async function open(): Promise<PdfDocumentProxy> {
+async function open(): Promise<{ document: PdfDocumentProxy; close(): Promise<void> }> {
   const data = new Uint8Array(readFileSync(fixture));
-  return (await pdfjs.getDocument({ data, isEvalSupported: false }).promise) as unknown as PdfDocumentProxy;
+  const task = pdfjs.getDocument({ data }) as unknown as PdfLoadingTask;
+  return { document: await task.promise, close: () => task.destroy() };
 }
 
 describe("§13 gate 1 — extraction into chunks", () => {
   it("walks a real PDF from bytes to phonemized chunks", async () => {
-    const document = await open();
+    const { document, close } = await open();
     const decision = await surveyDocument(document, { allowOcr: false });
     // A born-digital page has a text layer worth using; §4.2 should say so.
     expect(decision.choice).toBe("embedded");
@@ -106,13 +107,13 @@ describe("§13 gate 1 — extraction into chunks", () => {
     expect(analysed.reflow.markers.length).toBeGreaterThan(0);
     expect(analysed.reflow.markers[0].footnoteBodyID).toBeDefined();
 
-    await document.destroy();
+    await close();
   }, 120_000);
 });
 
 describe("§13 gate 2 — Phase A over the document", () => {
   it("produces a monotonic, gap-free timeline of a plausible length", async () => {
-    const document = await open();
+    const { document, close } = await open();
     const decision = await surveyDocument(document, { allowOcr: false });
     const extraction = await extractDocument(document, "sample", decision);
     const analysed = await new LinguisticsPipeline(new EspeakPhonemizer()).run(extraction.blocks);
@@ -158,6 +159,6 @@ describe("§13 gate 2 — Phase A over the document", () => {
     for (let i = 1; i < offsets.length; i++) expect(offsets[i]).toBeGreaterThan(offsets[i - 1]);
     expect(offsets[offsets.length - 1]).toBe(layout.totalFrames);
 
-    await document.destroy();
+    await close();
   }, 120_000);
 });

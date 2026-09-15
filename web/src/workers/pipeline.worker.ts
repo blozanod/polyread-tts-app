@@ -1,11 +1,18 @@
 /// <reference lib="webworker" />
-import * as pdfjs from "pdfjs-dist";
-import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
+// pdf.js ships two builds. The default one targets browsers newer than any
+// currently shipping: version 6 calls `Map.prototype.getOrInsertComputed`, a
+// proposal method that Chromium 141 still does not have, and page rendering
+// throws `getOrInsertComputed is not a function` on a browser most people are
+// actually running. The `legacy` build is the same library with the polyfills
+// in — about 160 KB more, against the 26 MB of WebAssembly this app already
+// loads, which is not a trade worth thinking about.
+import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
+import pdfWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.mjs?url";
 
 import { PolyReadError } from "../core/errors";
 import { SIDECAR_VERSION, type DocumentSidecar } from "../core/sidecar";
 import { extractDocument, surveyDocument } from "../extraction/documentExtractor";
-import type { PdfDocumentProxy } from "../extraction/pdfTypes";
+import type { PdfDocumentProxy, PdfLoadingTask } from "../extraction/pdfTypes";
 import type { BackendDecision } from "../extraction/quality";
 import { EspeakPhonemizer } from "../linguistics/espeakPhonemizer";
 import { LinguisticsPipeline } from "../linguistics/pipeline";
@@ -82,11 +89,17 @@ async function ensureEngine(): Promise<KokoroEngine> {
   return engine;
 }
 
-async function openPdf(bytes: ArrayBuffer): Promise<PdfDocumentProxy> {
+interface OpenPdf {
+  document: PdfDocumentProxy;
+  close(): Promise<void>;
+}
+
+async function openPdf(bytes: ArrayBuffer): Promise<OpenPdf> {
   // pdf.js mutates the buffer it is handed, and the same bytes are hashed and
   // archived, so it gets a copy.
-  const task = pdfjs.getDocument({ data: new Uint8Array(bytes.slice(0)), isEvalSupported: false });
-  return (await task.promise) as unknown as PdfDocumentProxy;
+  const task = pdfjs.getDocument({ data: new Uint8Array(bytes.slice(0)) }) as unknown as PdfLoadingTask;
+  const document = await task.promise;
+  return { document, close: () => task.destroy() };
 }
 
 async function runImport(bytes: ArrayBuffer, fileName: string, allowOcr: boolean): Promise<void> {
@@ -99,7 +112,13 @@ async function runImport(bytes: ArrayBuffer, fileName: string, allowOcr: boolean
   }
 
   post({ type: "stage", stage: "Opening the PDF", done: 0, total: 1 });
-  const document = await openPdf(bytes);
+  const { document, close } = await openPdf(bytes);
+  let closed = false;
+  const release = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    await close();
+  };
 
   post({ type: "stage", stage: "Checking the text layer", done: 0, total: 1 });
   let decision: BackendDecision = await surveyDocument(document, { allowOcr });
@@ -109,7 +128,7 @@ async function runImport(bytes: ArrayBuffer, fileName: string, allowOcr: boolean
       confirmResolver = resolve;
     });
     if (!proceed) {
-      await document.destroy();
+      await release();
       return;
     }
   }
@@ -183,7 +202,7 @@ async function runImport(bytes: ArrayBuffer, fileName: string, allowOcr: boolean
     engine: kokoro.info,
   });
 
-  await document.destroy();
+  await release();
   void coordinator.startPhaseB(emit);
 }
 

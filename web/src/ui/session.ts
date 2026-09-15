@@ -189,7 +189,7 @@ export class Session {
         message: message || "The pipeline stopped unexpectedly.",
         detail:
           "This is usually the model being too large for the memory available. " +
-          "A smaller one — npm run assets -- --dtype q8f16 — should get past it.",
+          "A smaller one — npm run assets -- --dtype q8 — should get past it.",
       },
     });
   }

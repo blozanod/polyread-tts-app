@@ -1,5 +1,5 @@
 {
-  "name": "polyread-web",
+  "name": "polyread",
   "productName": "PolyRead",
   "version": "0.1.0",
   "private": true,
@@ -16,31 +16,51 @@
     "typecheck": "tsc --noEmit",
     "assets": "node scripts/fetch-assets.mjs",
     "electron:build": "node scripts/build-electron.mjs",
-    "desktop": "npm run build && npm run electron:build && electron .",
-    "dist": "npm run build && npm run electron:build && electron-builder",
-    "dist:linux": "npm run build && npm run electron:build && electron-builder --linux",
-    "dist:win": "npm run build && npm run electron:build && electron-builder --win",
-    "dist:mac": "npm run build && npm run electron:build && electron-builder --mac"
+    "desktop": "npm run desktop:check && npm run build && npm run electron:build && electron .",
+    "dist": "npm run desktop:check && npm run build && npm run electron:build && electron-builder",
+    "dist:linux": "npm run desktop:check && npm run build && npm run electron:build && electron-builder --linux",
+    "dist:win": "npm run desktop:check && npm run build && npm run electron:build && electron-builder --win",
+    "dist:mac": "npm run desktop:check && npm run build && npm run electron:build && electron-builder --mac",
+    "desktop:setup": "npm install --save-dev electron@^44.3.0 electron-builder@^26.15.3",
+    "desktop:check": "node scripts/check-desktop-deps.mjs && tsc --noEmit -p electron/tsconfig.json"
   },
   "dependencies": {
-    "onnxruntime-web": "^1.20.1",
-    "pdfjs-dist": "^4.10.38",
+    "onnxruntime-web": "^1.30.0",
+    "pdfjs-dist": "^6.3.289",
     "phonemizer": "^1.2.1",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
   },
   "devDependencies": {
-    "@types/react": "^18.3.12",
-    "@types/react-dom": "^18.3.1",
-    "@vitejs/plugin-react": "^4.3.4",
-    "electron": "^33.2.1",
-    "electron-builder": "^25.1.8",
-    "esbuild": "^0.24.0",
-    "typescript": "^5.7.2",
-    "vite": "^6.0.3",
-    "vitest": "^2.1.8"
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0",
+    "vitest": "^5.0.0"
   },
   "optionalDependencies": {
-    "tesseract.js": "^5.1.1"
-  }
+    "tesseract.js": "^7.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "allowScripts": {
+    "esbuild": true,
+    "protobufjs": true,
+    "electron": true,
+    "electron-winstaller": true,
+    "tesseract.js": false
+  },
+  "homepage": "https://github.com/blozanod/polyread-tts-app",
+  "author": {
+    "name": "blozanod",
+    "url": "https://github.com/blozanod"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/blozanod/polyread-tts-app.git"
+  },
+  "desktopName": "polyread.desktop"
 }

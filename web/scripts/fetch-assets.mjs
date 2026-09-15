@@ -41,7 +41,7 @@ const DEFAULT_VOICES = [
 ];
 
 function parseArgs(argv) {
-  const args = { dtype: "fp16", voices: "default", voicesFromNpm: false, force: false, repo: MODEL_REPO };
+  const args = { dtype: "fp16", voices: "default", voicesFromNpm: false, force: false, list: false, repo: MODEL_REPO };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--dtype") args.dtype = argv[++i];
@@ -49,12 +49,14 @@ function parseArgs(argv) {
     else if (arg === "--voices-from-npm") args.voicesFromNpm = true;
     else if (arg === "--repo") args.repo = argv[++i];
     else if (arg === "--force") args.force = true;
+    else if (arg === "--list") args.list = true;
     else if (arg === "--help" || arg === "-h") {
       console.log(
         [
           "Usage: node scripts/fetch-assets.mjs [options]",
           "",
-          "  --dtype <fp32|fp16|q8f16|q8|q4|q4f16>  model precision (default fp16)",
+          "  --list                                 show what the repository publishes, and stop",
+          "  --dtype <fp32|fp16|q8|q4|q4f16|FILE>   model precision, or an exact filename (default fp16)",
           "  --voices <default|all|a,b,c>           which voices (default: the B-and-better ones)",
           "  --voices-from-npm                      take voices from the kokoro-js package instead of the Hub",
           "  --repo <owner/name>                    a different model repository",
@@ -79,27 +81,86 @@ async function listRepo(repo) {
   return (info.siblings ?? []).map((s) => s.rfilename);
 }
 
+/**
+ * dtype -> the filename onnx-community publishes it under.
+ *
+ * These follow transformers.js's suffix convention, which is what the Kokoro
+ * ONNX repository is laid out for. The mapping is not one word to one file —
+ * `q8` is published as `model_quantized.onnx`, not `model_q8.onnx` — so each
+ * dtype lists every spelling worth trying, and `--list` exists for when none of
+ * them match because a re-export moved things.
+ */
+const DTYPE_FILES = {
+  fp32: ["model.onnx"],
+  fp16: ["model_fp16.onnx"],
+  q8: ["model_quantized.onnx", "model_q8.onnx", "model_uint8.onnx"],
+  q4: ["model_q4.onnx"],
+  q4f16: ["model_q4f16.onnx"],
+  int8: ["model_int8.onnx"],
+  uint8: ["model_uint8.onnx"],
+};
+
+function onnxFiles(files) {
+  return files.filter((f) => f.endsWith(".onnx"));
+}
+
 /** Which file in the repo is the model at this precision. */
 function pickModelFile(files, dtype) {
-  const onnx = files.filter((f) => f.endsWith(".onnx") && !f.includes("/data/"));
-  const wanted =
-    dtype === "fp32"
-      ? ["onnx/model.onnx", "model.onnx"]
-      : [`onnx/model_${dtype}.onnx`, `model_${dtype}.onnx`];
-  for (const candidate of wanted) {
-    if (onnx.includes(candidate)) return candidate;
+  const onnx = onnxFiles(files);
+
+  // An exact filename always wins, so a repository this script has never seen
+  // can still be used without editing it.
+  const exact = onnx.find((f) => f === dtype || f.endsWith(`/${dtype}`) || f === `onnx/${dtype}`);
+  if (exact) return exact;
+
+  for (const name of DTYPE_FILES[dtype] ?? []) {
+    const match = onnx.find((f) => f === name || f === `onnx/${name}`);
+    if (match) return match;
   }
+
   throw new Error(
-    `No model file for --dtype ${dtype}. ${repoHint(onnx)}`,
+    `No model file for --dtype ${dtype}.\n` +
+      `This repository publishes:\n${onnx.map((f) => `  ${f}`).join("\n")}\n` +
+      "Pass one of those filenames directly, e.g. --dtype model_q4f16.onnx",
   );
 }
 
-function repoHint(files) {
-  const dtypes = files
-    .map((f) => /model(?:_([a-z0-9]+))?\.onnx$/.exec(f.split("/").pop() ?? ""))
-    .filter(Boolean)
-    .map((m) => m[1] ?? "fp32");
-  return `Available: ${[...new Set(dtypes)].sort().join(", ")}`;
+async function listAndExit(repo) {
+  const files = await listRepo(repo);
+  const sizes = await fileSizes(repo);
+  const show = (name) => {
+    const size = sizes.get(name);
+    return `  ${name}${size ? `  (${mb(size)})` : ""}`;
+  };
+
+  console.log(`${repo} publishes:\n`);
+  console.log("Models:");
+  for (const file of onnxFiles(files).sort()) console.log(show(file));
+
+  const voices = files.filter((f) => f.startsWith("voices/") && f.endsWith(".bin"));
+  console.log(`\nVoices: ${voices.length} files, about 0.5 MB each`);
+  console.log(`  ${voices.slice(0, 6).map((f) => f.slice(7, -4)).join(", ")}${voices.length > 6 ? ", …" : ""}`);
+
+  console.log("\nThe same download serves the website and the desktop installers.");
+  console.log("Pick one model file and run, for example:");
+  console.log("  node scripts/fetch-assets.mjs --dtype fp16");
+}
+
+/** Sizes, if the Hub will give them. Best-effort: the listing is useful without. */
+async function fileSizes(repo) {
+  const sizes = new Map();
+  for (const path of ["", "onnx"]) {
+    try {
+      const response = await fetch(`${HUB}/api/models/${repo}/tree/main/${path}`);
+      if (!response.ok) continue;
+      for (const entry of await response.json()) {
+        if (entry.type === "file" && typeof entry.size === "number") sizes.set(entry.path, entry.size);
+      }
+    } catch {
+      // No sizes; the names are the part that matters.
+    }
+  }
+  return sizes;
 }
 
 async function download(url, destination, label, force) {
@@ -175,6 +236,10 @@ async function voicesFromNpm(names) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  if (args.list) {
+    await listAndExit(args.repo);
+    return;
+  }
   await mkdir(outDir, { recursive: true });
 
   console.log(`PolyRead assets -> ${outDir}`);

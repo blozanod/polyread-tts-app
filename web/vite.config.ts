@@ -30,8 +30,4 @@ export default defineConfig({
       "Cross-Origin-Embedder-Policy": "require-corp",
     },
   },
-  test: {
-    environment: "node",
-    include: ["tests/**/*.test.ts"],
-  },
-} as never);
+});

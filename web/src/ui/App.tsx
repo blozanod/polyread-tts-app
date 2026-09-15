@@ -1,3 +1,4 @@
+import type { ReactElement } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PageView } from "./PageView";
 import { ReflowView } from "./ReflowView";
@@ -9,9 +10,9 @@ import { loadSettings, saveSettings, type AppSettings } from "./settings";
 
 type Screen = "library" | "reader" | "settings";
 
-export function App(): JSX.Element {
+export function App() {
   const [settings, setSettings] = useState<AppSettings>(loadSettings);
-  const sessionRef = useRef<Session>();
+  const sessionRef = useRef<Session | undefined>(undefined);
   if (!sessionRef.current) sessionRef.current = new Session(settings);
   const session = sessionRef.current;
 
@@ -55,7 +56,7 @@ export function App(): JSX.Element {
   // Opening a document takes you to it — but only once, when it becomes the
   // current document. Keying this on the status instead would bounce you
   // straight back here every time you tried to return to the library.
-  const shown = useRef<string>();
+  const shown = useRef<string | undefined>(undefined);
   useEffect(() => {
     const hash = state?.document?.contentHash;
     if (state?.status.kind === "ready" && hash && shown.current !== hash) {
@@ -206,7 +207,7 @@ export function App(): JSX.Element {
   );
 }
 
-function StatusBanner({ state, session }: { state: SessionState; session: Session }): JSX.Element | null {
+function StatusBanner({ state, session }: { state: SessionState; session: Session }): ReactElement | null {
   const { status } = state;
 
   if (status.kind === "working") {
@@ -282,7 +283,7 @@ function Library({
   state: SessionState;
   session: Session;
   onOpen: () => void;
-}): JSX.Element {
+}) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
 

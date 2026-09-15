@@ -48,7 +48,12 @@ nsis:
   allowToChangeInstallationDirectory: true
 
 linux:
+  # Debian packaging insists on a maintainer address. This is the GitHub
+  # no-reply form, so building a .deb does not put a personal email into every
+  # copy that gets distributed — change it if you would rather be reachable.
+  maintainer: blozanod <blozanod@users.noreply.github.com>
   category: Office
+  syncDesktopName: true
   target:
     - target: AppImage
       arch: [x64]

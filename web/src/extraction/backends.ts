@@ -138,7 +138,14 @@ export class OcrBackend implements TextRunBackend {
     const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
     const context = canvas.getContext("2d");
     if (!context) return [];
-    await page.render({ canvasContext: context as CanvasRenderingContext2D, viewport }).promise;
+    // An OffscreenCanvas is not an HTMLCanvasElement, so this takes pdf.js's
+    // context path — which is exactly what it is kept for, and requires
+    // `canvas` to be null.
+    await page.render({
+      canvas: null,
+      canvasContext: context as CanvasRenderingContext2D,
+      viewport,
+    }).promise;
 
     const { data } = await worker.recognize(canvas);
     this.meanConfidence += data.confidence;
