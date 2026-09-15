@@ -71,7 +71,25 @@ export function columnSplitX(runs: readonly TextRun[], pageBox: Rect): number | 
   return minX(pageBox) + centre;
 }
 
-/** Runs whose baselines agree within half a glyph height are one line. */
+/**
+ * Runs whose baselines agree within half a glyph height are one line.
+ *
+ * The grouping pass walks the column in baseline order, so the runs land in a
+ * line in *baseline* order — which is only reading order when every run on the
+ * line shares one baseline exactly. That holds for a born-digital page, where
+ * pdf.js emits a whole line as one text item and `splitItemIntoRuns` copies the
+ * item's single `transform[5]` onto every word it cuts out. It does not hold
+ * for the per-word text layer a scan carries: OCR gives each word its own
+ * baseline, and they disagree by a fraction of a point.
+ *
+ * Sub-point disagreement is invisible on the page and changes nothing about
+ * which line a word belongs to — but sorting on it puts the words of a line in
+ * an order that has nothing to do with where they sit, and a paragraph comes
+ * out as its own words shuffled. So reading order is restored explicitly here,
+ * once, rather than being left to depend on how the baselines happened to tie:
+ * a `Line`'s runs are left-to-right, which is what `lineText` and
+ * `tokenizeParagraph` have always assumed they were reading.
+ */
 export function groupIntoLines(runs: readonly TextRun[]): Line[] {
   if (runs.length === 0) return [];
   const byColumn = new Map<number, TextRun[]>();
@@ -101,7 +119,15 @@ export function groupIntoLines(runs: readonly TextRun[]): Line[] {
       lines.push({ runs: current, columnIndex: column, pageIndex: current[0].pageIndex });
     }
   }
-  return attachSuperscripts(lines);
+  // After `attachSuperscripts`, so a marker folded into its host line takes its
+  // place beside the word it annotates rather than at the end of the line.
+  return inReadingOrder(attachSuperscripts(lines));
+}
+
+/** Left-to-right within each line. The invariant every later pass relies on. */
+function inReadingOrder(lines: Line[]): Line[] {
+  for (const line of lines) line.runs.sort((a, b) => minX(a.bbox) - minX(b.bbox));
+  return lines;
 }
 
 /**
@@ -181,21 +207,28 @@ export function orderRuns(runs: readonly TextRun[], pageBox: Rect): TextRun[] {
 
   // Group into lines before sorting: sorting individual runs by y alone
   // shuffles words whose baselines differ by a fraction of a point.
-  const lines = groupIntoLines(out);
-  const sorted = lines.sort((a, b) => {
+  //
+  // The comparator is a plain total order — column, then down the page, then
+  // across it. It used to compare baselines through a tolerance and fall back
+  // to x when they were close, which is not transitive: with lines a, b, c
+  // where a and b are close, b and c are close, but a and c are not, the
+  // answer depends on which pairs the sort happens to compare, and V8 changes
+  // that at 22 elements. `groupIntoLines` has already merged everything within
+  // a line's tolerance into one `Line`, so two lines left in the same column
+  // genuinely differ in baseline and the tolerance bought nothing.
+  const sorted = groupIntoLines(out).sort((a, b) => {
     if (a.columnIndex !== b.columnIndex) return a.columnIndex - b.columnIndex;
-    const ab = lineBaseline(a);
-    const bb = lineBaseline(b);
-    if (Math.abs(ab - bb) > Math.max(lineGlyphHeight(a), lineGlyphHeight(b)) * 0.5) {
-      return bb - ab; // origin bottom-left: higher y is earlier
-    }
+    // Origin bottom-left: higher y is earlier.
+    const byBaseline = lineBaseline(b) - lineBaseline(a);
+    if (byBaseline !== 0) return byBaseline;
     return minX(lineBBox(a)) - minX(lineBBox(b));
   });
 
   const result: TextRun[] = [];
   let orderIndex = 0;
   for (const line of sorted) {
-    for (const run of [...line.runs].sort((a, b) => minX(a.bbox) - minX(b.bbox))) {
+    // `groupIntoLines` already put these left to right.
+    for (const run of line.runs) {
       run.orderIndex = orderIndex++;
       result.push(run);
     }

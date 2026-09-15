@@ -181,8 +181,20 @@ export class OcrBackend implements TextRunBackend {
   }
 
   async dispose(): Promise<void> {
-    await this.worker?.terminate();
+    const worker = this.worker;
     this.worker = undefined;
+    // Tesseract reports its own internal failures by aborting the wasm module,
+    // which can leave `terminate` rejecting with whatever it died of — "index
+    // out of bounds" among them. That rejection used to escape `extractDocument`
+    // through the `finally` that calls this, so a recognizer that fell over
+    // while tearing down surfaced as a bare C++ assertion in the error card and
+    // took the rest of the import with it. There is nothing to recover here:
+    // the worker is being thrown away.
+    try {
+      await worker?.terminate();
+    } catch {
+      // Already gone.
+    }
   }
 }
 

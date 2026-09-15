@@ -204,6 +204,28 @@ export function insertionToken(marker: Block, block: Block, tokenCount: number):
   return best >= 0 ? best : tokenCount;
 }
 
+/**
+ * Half a body line. Markers whose midpoints land in the same band of this size
+ * are treated as being on the same line of type.
+ */
+const MARKER_LINE_BAND = 4;
+
+/**
+ * Two markers in document order: down the page, then across it.
+ *
+ * "Same line" is decided by snapping each midpoint to a fixed band rather than
+ * by comparing the two midpoints through a tolerance. The tolerance form reads
+ * more naturally and is not a valid ordering: markers a and b can be within
+ * tolerance, b and c within tolerance, and a and c not, so the comparator
+ * contradicts itself and `Array.prototype.sort` may return anything at all.
+ *
+ * The band has to be a constant rather than anything derived from the pair —
+ * an average of the two heights is still pair-dependent, and brings the same
+ * problem back. A fixed grid can put two markers a tenth of a point apart in
+ * different bands if they straddle an edge, which costs an ordering swap
+ * between two markers of one paragraph; that is the smaller failure, and a
+ * bounded one.
+ */
 export function readingOrderCompare(a: SourceSpan | undefined, b: SourceSpan | undefined): number {
   if (!a || !b) return 0;
   if (a.pageIndex !== b.pageIndex) return a.pageIndex - b.pageIndex;
@@ -211,8 +233,8 @@ export function readingOrderCompare(a: SourceSpan | undefined, b: SourceSpan | u
   const bb = b.bboxes[0];
   if (!ab || !bb) return 0;
   // PDF user space: origin bottom-left, so later on the page means lower y.
-  if (Math.abs(midY(ab) - midY(bb)) > Math.max(ab.height, bb.height) * 0.5) {
-    return midY(bb) - midY(ab);
-  }
+  const byLine =
+    Math.floor(midY(bb) / MARKER_LINE_BAND) - Math.floor(midY(ab) / MARKER_LINE_BAND);
+  if (byLine !== 0) return byLine;
   return minX(ab) - minX(bb);
 }

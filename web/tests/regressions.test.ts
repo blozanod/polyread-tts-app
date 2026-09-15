@@ -4,7 +4,10 @@ import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { pdfAssetOptions } from "../src/extraction/pdfAssets";
-import { newID, textRange, type Block, type PhonemizedChunk } from "../src/core/types";
+import { newID, textRange, type Block, type PhonemizedChunk, type SourceSpan, type TextRun } from "../src/core/types";
+import { rect } from "../src/core/geometry";
+import { readingOrderCompare } from "../src/core/reflow";
+import { groupIntoLines, lineBaseline, lineText, orderRuns } from "../src/extraction/pageLayout";
 import { tokensOf } from "../src/core/spanInvariant";
 import { SynthesisCoordinator } from "../src/synthesis/coordinator";
 import type { KokoroEngine } from "../src/synthesis/kokoroEngine";
@@ -328,5 +331,100 @@ describe("§7.3 render scheduling", () => {
     await coordinator.startPhaseB(() => undefined);
 
     expect(renders()).toBe(chunks.length - 1);
+  });
+});
+
+/**
+ * A JSTOR scan carries a per-word invisible text layer, and OCR gives every
+ * word its own baseline. They disagree by a fraction of a point — invisible on
+ * the page, and nowhere near enough to put a word on a different line.
+ *
+ * `groupIntoLines` walks a column in baseline order, so that is the order the
+ * runs landed in a `Line`, and nothing put them back. `orderRuns` happened to
+ * sort each line's runs by x on its way out, which hid it; but the extractor
+ * calls `groupIntoLines` a second time, on those already-ordered runs, and the
+ * second pass re-sorted them by baseline and threw the reading order away. What
+ * reached the reader was every paragraph with its own words shuffled.
+ *
+ * It only ever showed on a scan. A born-digital page emits a whole line as one
+ * text item, so `splitItemIntoRuns` copies one exact `transform[5]` onto every
+ * word of the line, the baselines tie, the sort is stable, and the order
+ * survives — which is why the cover page of the same PDF read perfectly and
+ * every test here used exactly-equal baselines and passed.
+ */
+describe("per-word baselines (a scanned text layer)", () => {
+  const PAGE_BOX = rect(0, 0, 612, 792);
+  const SENTENCE = "Science is the summum bonum of our society and that therefore all";
+
+  /** `wobble` of 0 is one text item per line; anything else is per-word. */
+  function scannedPage(wobble: number): TextRun[] {
+    const words = SENTENCE.split(" ");
+    const runs: TextRun[] = [];
+    let index = 0;
+    for (let lineIndex = 0; index < words.length; lineIndex++) {
+      let x = 72;
+      const baseline = 700 - lineIndex * 12;
+      for (let k = 0; k < 6 && index < words.length; k++, index++) {
+        const text = words[index];
+        const width = text.length * 5;
+        // Deterministic, sub-point, and well inside the grouping tolerance.
+        const noise = wobble * Math.sin(index * 2.399);
+        runs.push({
+          text,
+          bbox: rect(x, baseline + noise - 2, width, 10),
+          glyphHeight: 10,
+          baseline: baseline + noise,
+          pageIndex: 0,
+          columnIndex: 0,
+          orderIndex: 0,
+        });
+        x += width + 4;
+      }
+    }
+    return runs;
+  }
+
+  it("keeps a line's words in reading order however their baselines tie", () => {
+    for (const wobble of [0, 0.05, 0.25, 1]) {
+      const lines = groupIntoLines(scannedPage(wobble));
+      expect(lines.map(lineText).join(" ")).toBe(SENTENCE);
+    }
+  });
+
+  it("survives the extractor's second pass over ordered runs", () => {
+    for (const wobble of [0, 0.05, 0.25, 1]) {
+      // orderRuns, then groupIntoLines again — what extractDocument does.
+      const ordered = orderRuns(scannedPage(wobble), PAGE_BOX);
+      const lines = groupIntoLines(ordered).sort((a, b) => lineBaseline(b) - lineBaseline(a));
+      expect(lines.map(lineText).join(" ")).toBe(SENTENCE);
+    }
+  });
+
+  /**
+   * Both of these compared two positions through a tolerance and fell back to x
+   * when they were close, which is not a transitive relation: a≈b and b≈c does
+   * not give a≈c, so the comparator contradicts itself and the sort may return
+   * anything. V8 switches from insertion sort to TimSort at 22 elements, so it
+   * held on small inputs and came apart on a full page.
+   */
+  it("orders lines and markers with transitive comparators", () => {
+    const spanAt = (y: number, x: number): SourceSpan => ({
+      pageIndex: 0,
+      bboxes: [rect(x, y, 6, 6)],
+      reflowRange: textRange(0, 0),
+    });
+    // A chain that steps by less than the old tolerance at every step but
+    // spans several lines end to end.
+    const spans = Array.from({ length: 40 }, (_, i) => spanAt(700 - i * 2, 500 - i * 10));
+    for (const a of spans) {
+      for (const b of spans) {
+        for (const c of spans) {
+          const ab = Math.sign(readingOrderCompare(a, b));
+          const bc = Math.sign(readingOrderCompare(b, c));
+          if (ab < 0 && bc < 0) expect(Math.sign(readingOrderCompare(a, c))).toBeLessThan(0);
+          if (ab === 0 && bc === 0) expect(Math.sign(readingOrderCompare(a, c))).toBe(0);
+        }
+      }
+    }
   });
 });
