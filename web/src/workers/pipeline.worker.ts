@@ -250,7 +250,14 @@ async function importDocument(
   const release = async (): Promise<void> => {
     if (closed) return;
     closed = true;
-    await close();
+    // Handing the PDF back is cleanup, and cleanup that throws on the way out
+    // must not be able to take Phase B down with it — see the note at the end
+    // of this function.
+    try {
+      await close();
+    } catch {
+      // Nothing left to do with it either way.
+    }
   };
 
   post({ type: "stage", stage: "Checking the text layer", done: 0, total: 1 });
@@ -340,10 +347,35 @@ async function importDocument(
   // After the reader, not before it: writing a few megabytes of PDF and a
   // sidecar into IndexedDB is not something anyone should be watching a
   // loading bar for.
-  await persist(current.sidecar, analysed.mainChunks.length, phaseA.duration);
-  await store.putOriginal(hash, bytes);
-  await store.evictToFit(settings?.cacheCapBytes ?? 4 * 1024 ** 3, hash);
-  post({ type: "library", entries: await store.list() });
+  //
+  // And none of it is allowed to decide whether the document ever speaks.
+  // Every call below is the cache, and the cache is an optimization: it makes
+  // the *next* open instant and the page view work offline. Phase B is the
+  // feature. Leaving these unguarded in front of `startSynthesis` meant a
+  // browser that refused one write — a quota reached on a multi-megabyte
+  // original, a store blocked by another tab, eviction under storage pressure
+  // — threw past the synthesis call into the top-level handler, which posted
+  // the error and returned. What that looks like from the outside is the bug
+  // this fixes: the reader opens, the estimated duration is there, the voice
+  // says it is ready, and pressing play does nothing at all, for ever, because
+  // nothing is ever rendered. `persistProgress` already understood this — "a
+  // cache that will not take a write is not a reason to stop rendering" — but
+  // only for the writes it makes during Phase B, not the ones in front of it.
+  try {
+    await persist(current.sidecar, analysed.mainChunks.length, phaseA.duration);
+    await store.putOriginal(hash, bytes);
+    await store.evictToFit(settings?.cacheCapBytes ?? 4 * 1024 ** 3, hash);
+    post({ type: "library", entries: await store.list() });
+  } catch (error) {
+    post({
+      type: "error",
+      message: new PolyReadError(
+        "cacheWriteFailed",
+        error instanceof Error ? error.message : String(error),
+      ).message,
+      kind: "cacheWriteFailed",
+    });
+  }
 
   await startSynthesis(coordinator, engineReady);
 }
