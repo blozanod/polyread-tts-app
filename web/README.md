@@ -15,10 +15,15 @@ Node 20 or newer. Node 24 and npm 11 are what this is currently built against.
 
 ```sh
 cd web
-npm install          # 83 packages, no warnings, no vulnerabilities
+npm install          # 87 packages, no warnings, no vulnerabilities
 npm run assets       # downloads the Kokoro model and voices into public/models
 npm run dev          # http://localhost:5173
 ```
+
+`npm run fonts` is the other fetch, and it has already been run: Archivo and
+IBM Plex Mono live in `public/fonts/`, so the app carries the typography of
+blozanod.me without asking Google for it on every load. Re-run it only to
+change or update a face.
 
 The desktop toolchain is deliberately not part of that install. Electron and
 electron-builder are 280 further packages and every deprecation warning the
@@ -329,6 +334,25 @@ need their platform binaries, Electron needs its runtime) and declines
 tesseract.js's, which only prints a funding notice. If npm asks anyway it is
 older than the policy field; `npm install-scripts approve --all` has the same
 effect.
+
+**A scanned PDF renders as blank white pages.** This was a real bug, fixed
+here, and the shape of it is worth knowing because it fails silently. pdf.js 6
+decodes JBIG2 — the encoding behind essentially every library scan, JSTOR and
+course reserves included — in a WebAssembly module it fetches from the `wasmUrl`
+option at runtime. Given no `wasmUrl`, it does not throw: it logs
+`Jbig2Error: JBig2 failed to initialize`, skips the image, and hands back a page
+carrying nothing but its text layer. `standardFontDataUrl` fails the same way
+and quietly clips extracted text mid-word. All four asset roots are now served
+out of `pdfjs/` by the `pdfjsAssets` plugin in `vite.config.ts` and handed over
+by `src/extraction/pdfAssets.ts`. If scans go blank again, check that
+`dist/pdfjs/wasm/jbig2.wasm` is being served.
+
+**Nothing is read aloud and the clock runs anyway.** Also fixed. The audio
+worklet reads unrendered audio as a hole of silence, so playback used to run
+straight through a document that had not been synthesized yet — silently, with
+the position advancing. Reaching unrendered audio now parks the playhead, says
+so in the transport, renders that chunk and resumes by itself. If it parks and
+never resumes, the model did not load: the chip in the header says which.
 
 **"getOrInsertComputed is not a function".** You are on the wrong pdf.js build.
 The app imports `pdfjs-dist/legacy/build/pdf.mjs` on purpose — pdf.js 6's

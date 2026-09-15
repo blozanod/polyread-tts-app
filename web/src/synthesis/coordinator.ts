@@ -45,6 +45,15 @@ export class SynthesisCoordinator {
   private blocks: Block[] = [];
   private cancelled = false;
   private renderingPromise: Promise<void> | undefined;
+  /**
+   * Renders in flight, by chunk index.
+   *
+   * Phase B and an on-demand render routinely want the same chunk: pressing
+   * play on a fresh document starves on chunk 0 at the same moment Phase B is
+   * already rendering it. Without this they both run, and the duplicate costs a
+   * full acoustic pass on the one chunk the listener is actually waiting for.
+   */
+  private readonly inFlight = new Map<number, Promise<void>>();
   readonly progress = new RenderProgress();
 
   constructor(engine: KokoroEngine, config: CoordinatorConfig) {
@@ -155,6 +164,7 @@ export class SynthesisCoordinator {
         if (this.cancelled) return;
         if (this.progress.renderedChunks.has(index)) continue;
         await this.renderChunk(index, emit);
+        if (this.cancelled) return;
 
         if (!primed) {
           const lead = this.progress.renderedThrough;
@@ -183,7 +193,20 @@ export class SynthesisCoordinator {
     await this.renderChunk(chunkIndex, emit);
   }
 
-  private async renderChunk(index: number, emit: (event: CoordinatorEvent) => void): Promise<void> {
+  /** True while `chunkIndex` is being rendered by either path. */
+  isRendering(chunkIndex: number): boolean {
+    return this.inFlight.has(chunkIndex);
+  }
+
+  private renderChunk(index: number, emit: (event: CoordinatorEvent) => void): Promise<void> {
+    const existing = this.inFlight.get(index);
+    if (existing) return existing;
+    const work = this.renderChunkOnce(index, emit).finally(() => this.inFlight.delete(index));
+    this.inFlight.set(index, work);
+    return work;
+  }
+
+  private async renderChunkOnce(index: number, emit: (event: CoordinatorEvent) => void): Promise<void> {
     const layout = this.layout;
     if (!layout) return;
     const entry = layout.entries[index];

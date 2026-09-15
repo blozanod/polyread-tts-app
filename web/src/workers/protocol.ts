@@ -25,14 +25,26 @@ export interface EngineSettings {
   device: "auto" | "webgpu" | "wasm";
   /** CPU threads for the WebAssembly backend; 0 leaves it to the engine. */
   threads: number;
-  /** §7.3 — "Dismiss the loading bar when Phase A completes and ~60 s of audio exists." */
+  /**
+   * §7.3 — "Dismiss the loading bar when Phase A completes and ~60 s of audio
+   * exists." The default is 20 s rather than 60: the reader is fully usable
+   * before any of it exists, so the lead only decides when the "rendering
+   * ahead" note goes away, and 60 s of it was a minute of being told to wait
+   * for something that had already happened.
+   */
   initialAudioLead: number;
   /** §7.4 — LRU cap, in bytes. */
   cacheCapBytes: number;
 }
 
 export type WorkerRequest =
-  | { type: "configure"; settings: EngineSettings }
+  /**
+   * `pdfAssetBase` is an absolute URL, resolved against the page before it is
+   * sent. It cannot be resolved on this side of the boundary: a relative URL
+   * inside the worker resolves against the worker script in `assets/`, one
+   * directory too deep. See `extraction/pdfAssets.ts`.
+   */
+  | { type: "configure"; settings: EngineSettings; pdfAssetBase: string }
   | { type: "import"; bytes: ArrayBuffer; fileName: string; allowOcr: boolean }
   | { type: "confirmLowConfidence"; proceed: boolean }
   | { type: "open"; contentHash: string }
@@ -61,6 +73,13 @@ export interface ImportedDocument {
 
 export type WorkerEvent =
   | { type: "stage"; stage: string; done: number; total: number }
+  /**
+   * The voice model, loading in parallel with extraction. It is reported
+   * separately from `stage` because the two overlap: the document is being
+   * read while the model is still downloading, and collapsing them into one
+   * bar would make each look stalled while the other ran.
+   */
+  | { type: "model"; phase: "loading" | "ready" | "failed"; label: string; done: number; total: number }
   /**
    * §7.3's priming, which is *not* a stage: by the time it starts, Phase A has
    * finished and the reader is already usable — text, timeline, scrubber and

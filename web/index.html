@@ -4,11 +4,24 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
-    <title>PolyRead</title>
+    <meta name="theme-color" content="#e9e9e7" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#17171a" media="(prefers-color-scheme: dark)" />
+    <title>PolyRead — blozanod.me</title>
     <meta
       name="description"
-      content="Reads academic PDFs aloud with word-level highlighting. Runs entirely on your own machine."
+      content="Reads academic PDFs aloud with word-level highlighting. Runs entirely in your own browser."
     />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <!-- Archivo and IBM Plex Mono, the two faces blozanod.me uses, served from
+         this app's own origin. See scripts/fetch-fonts.mjs. -->
+    <link
+      rel="preload"
+      href="./fonts/archivo-latin-1.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <link rel="stylesheet" href="./fonts/fonts.css" />
   </head>
   <body>
     <div id="root"></div>

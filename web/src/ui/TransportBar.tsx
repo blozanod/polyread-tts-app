@@ -1,6 +1,9 @@
 import { useCallback, useRef } from "react";
 
 /**
+ * §8.4's controls, as a pill floating over the document rather than a bar
+ * docked under it — the document is the thing worth the width.
+ *
  * §8.4 — "Play / pause. Skip ±15 s, snapped to the nearest `WordTiming`
  * boundary… Previous / next paragraph, using `Block` boundaries. Scrubber over
  * the `[WordTiming]` timeline, with the §7.3 buffer edge drawn on it."
@@ -18,6 +21,8 @@ export interface TransportBarProps {
   rate: number;
   /** False while the timeline's tail is still an estimate. */
   exact: boolean;
+  /** Whatever playback is waiting on, shown inside the pill. */
+  note?: string;
   onToggle(): void;
   onSkip(delta: number): void;
   onSeek(time: number): void;
@@ -29,7 +34,7 @@ export interface TransportBarProps {
 const RATES = [0.75, 1, 1.25, 1.5, 1.75, 2];
 
 export function TransportBar(props: TransportBarProps) {
-  const { time, duration, renderedThrough, playing, rate, exact } = props;
+  const { time, duration, renderedThrough, playing, rate, exact, note } = props;
   const trackRef = useRef<HTMLDivElement>(null);
 
   const seekFromPoint = useCallback(
@@ -112,6 +117,13 @@ export function TransportBar(props: TransportBarProps) {
           </select>
         </label>
       </div>
+
+      {note && (
+        <div className="transport-note" role="status">
+          <span className="dot" />
+          {note}
+        </div>
+      )}
     </div>
   );
 }

@@ -29,7 +29,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   voiceID: DEFAULT_VOICE,
   device: "auto",
   threads: 0,
-  initialAudioLead: 60,
+  initialAudioLead: 20,
   cacheCapBytes: 4 * 1024 ** 3,
   rate: 1,
   surface: "auto",

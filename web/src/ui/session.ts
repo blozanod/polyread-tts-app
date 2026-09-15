@@ -10,6 +10,7 @@ import type { EngineInfo } from "../synthesis/kokoroEngine";
 import type { BackendDecision } from "../extraction/quality";
 import type { ImportedDocument, WorkerEvent, WorkerRequest } from "../workers/protocol";
 import type { EngineSettings } from "../workers/protocol";
+import { pdfAssetBase } from "../extraction/pdfAssets";
 import { engineSettingsOf, type AppSettings } from "./settings";
 
 /**
@@ -46,9 +47,23 @@ export interface SessionState {
   renderComplete: boolean;
   /** §7.3 — how much audio exists against the lead the reader wants. */
   priming?: { seconds: number; target: number };
+  /** The voice model's own progress, which runs alongside `status`. */
+  model: ModelStatus;
+  /**
+   * Set while playback is parked on audio that does not exist yet. The transport
+   * says so and resumes itself; previously the worklet read the hole as silence
+   * and the clock ran on through a document nobody could hear.
+   */
+  waitingForAudio: boolean;
   benchmark?: string;
   diagnostics: string[];
 }
+
+export type ModelStatus =
+  | { kind: "idle" }
+  | { kind: "loading"; label: string; done: number; total: number }
+  | { kind: "ready"; device: string }
+  | { kind: "failed"; message: string };
 
 const EMPTY: SessionState = {
   status: { kind: "idle" },
@@ -61,6 +76,8 @@ const EMPTY: SessionState = {
   rate: 1,
   renderedThrough: 0,
   renderComplete: false,
+  model: { kind: "idle" },
+  waitingForAudio: false,
   diagnostics: [],
 };
 
@@ -82,6 +99,8 @@ export class Session {
   private lastEventAt = Date.now();
   private watchdog: ReturnType<typeof setInterval> | undefined;
   private threadOverride: number | undefined;
+  /** Set when starvation paused playback, so the chunk landing can resume it. */
+  private resumeWhenRendered = -1;
 
   constructor(settings: AppSettings) {
     this.settings = settings;
@@ -104,9 +123,20 @@ export class Session {
     this.audio.onEnded = () => {
       this.patch({ playing: false, time: this.state.duration, wordIndex: this.timeline.words.length - 1 });
     };
+    // Reaching unrendered audio used to be inaudible in the worst way: the
+    // worklet reads a hole as silence, so the clock kept running and the
+    // document played out in perfect quiet. Park the playhead instead, say why,
+    // render that chunk, and start again where we stopped.
     this.audio.onStarved = (time) => {
       const index = this.chunkIndexAt(time);
-      if (index < 0 || this.rendered.has(index) || index === this.pendingOnDemand) return;
+      if (index < 0 || this.rendered.has(index)) return;
+      if (this.state.playing) {
+        this.audio.pause();
+        void this.audio.seek(this.timeline.snapped(time));
+        this.resumeWhenRendered = index;
+        this.patch({ playing: false, waitingForAudio: true });
+      }
+      if (index === this.pendingOnDemand) return;
       this.pendingOnDemand = index;
       this.send({ type: "renderNow", chunkIndex: index });
     };
@@ -137,7 +167,7 @@ export class Session {
     this.worker.onmessageerror = () =>
       this.patch({ status: { kind: "error", message: "The pipeline sent something unreadable." } });
     this.lastEventAt = Date.now();
-    this.send({ type: "configure", settings: this.currentEngineSettings() });
+    this.send({ type: "configure", settings: this.currentEngineSettings(), pdfAssetBase: pdfAssetBase() });
   }
 
   private currentEngineSettings(): EngineSettings {
@@ -159,34 +189,54 @@ export class Session {
    * second attempt.
    */
   private checkForStall(): void {
-    if (this.state.status.kind !== "working") return;
+    // Either something is being imported, or the model is loading on its own —
+    // the warm-up now starts when the app does, so a hang there happens with no
+    // import in flight at all and would otherwise never be noticed.
+    const working = this.state.status.kind === "working";
+    const loading = this.state.model.kind === "loading";
+    if (!working && !loading) return;
+    // Every worker message refreshes this, model download progress included, so
+    // a load that is merely slow does not trip it. Only a silent one does.
     if (Date.now() - this.lastEventAt < 60_000) return;
-    if (!this.lastRequest) return;
 
     if (this.threadOverride === 1) {
       this.reportWorkerFailure("The model would not load.");
       return;
     }
     this.threadOverride = 1;
+    if (working) {
+      this.patch({
+        status: {
+          kind: "working",
+          stage: "The model stalled — retrying on a single thread",
+          done: 0,
+          total: 1,
+        },
+      });
+    }
     this.patch({
-      status: {
-        kind: "working",
-        stage: "The model stalled — retrying on a single thread",
-        done: 0,
-        total: 1,
-      },
+      model: { kind: "loading", label: "Stalled — retrying on a single thread", done: 0, total: 1 },
     });
     const request = this.lastRequest;
     this.spawnWorker();
-    this.send(request);
+    // `spawnWorker` re-sends configure, which re-warms the engine; an import
+    // that was in flight has to be asked for again.
+    if (request) this.send(request);
   }
 
   private reportWorkerFailure(message: string): void {
+    const duringImport = this.lastRequest !== undefined;
     this.lastRequest = undefined;
+    const text = message || "The pipeline stopped unexpectedly.";
+    this.patch({ model: { kind: "failed", message: text } });
+    // An error card only where it is news. With nothing being imported, the
+    // model chip and the library's own explanation of the missing model are
+    // already saying this, and a second card over the top of them is noise.
+    if (!duringImport) return;
     this.patch({
       status: {
         kind: "error",
-        message: message || "The pipeline stopped unexpectedly.",
+        message: text,
         detail:
           "This is usually the model being too large for the memory available. " +
           "A smaller one — npm run assets -- --dtype q8 — should get past it.",
@@ -227,6 +277,19 @@ export class Session {
         this.patch({ status: { kind: "working", stage: event.stage, done: event.done, total: event.total } });
         break;
 
+      case "model":
+        // Reported on its own track: it overlaps extraction, and it starts
+        // before there is any document for `status` to be about.
+        this.patch({
+          model:
+            event.phase === "ready"
+              ? { kind: "ready", device: event.label }
+              : event.phase === "failed"
+                ? { kind: "failed", message: event.label }
+                : { kind: "loading", label: event.label, done: event.done, total: event.total },
+        });
+        break;
+
       case "priming":
         this.patch({ priming: { seconds: event.seconds, target: event.target } });
         break;
@@ -249,6 +312,7 @@ export class Session {
           renderedThrough: 0,
           renderComplete: false,
           priming: undefined,
+          waitingForAudio: false,
           wordIndex: 0,
           time: 0,
         });
@@ -261,6 +325,11 @@ export class Session {
         if (this.pendingOnDemand === event.chunkIndex) this.pendingOnDemand = -1;
         void this.audio.chunkRendered(event.chunkIndex);
         this.patch({ renderedThrough: event.renderedThrough });
+        if (this.resumeWhenRendered === event.chunkIndex) {
+          this.resumeWhenRendered = -1;
+          this.patch({ waitingForAudio: false });
+          void this.play();
+        }
         break;
 
       case "timeline": {
@@ -400,7 +469,9 @@ export class Session {
   }
 
   pause(): void {
+    this.resumeWhenRendered = -1;
     this.audio.pause();
+    this.patch({ waitingForAudio: false });
   }
 
   async toggle(): Promise<void> {
@@ -414,6 +485,8 @@ export class Session {
   }
 
   async seek(time: number): Promise<void> {
+    this.resumeWhenRendered = -1;
+    if (this.state.waitingForAudio) this.patch({ waitingForAudio: false });
     const snapped = this.timeline.snapped(time);
     await this.audio.seek(snapped);
     const index = this.timeline.indexAt(snapped);
@@ -451,7 +524,7 @@ export class Session {
     // An explicit choice in Settings supersedes whatever the watchdog decided.
     if (settings.threads !== this.settings.threads) this.threadOverride = undefined;
     this.settings = settings;
-    this.send({ type: "configure", settings: this.currentEngineSettings() });
+    this.send({ type: "configure", settings: this.currentEngineSettings(), pdfAssetBase: pdfAssetBase() });
     if (settings.rate !== wasRate) this.setRate(settings.rate);
   }
 

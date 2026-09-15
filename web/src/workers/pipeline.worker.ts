@@ -12,6 +12,7 @@ import pdfWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.mjs?url";
 import { PolyReadError } from "../core/errors";
 import { SIDECAR_VERSION, type DocumentSidecar } from "../core/sidecar";
 import { extractDocument, surveyDocument } from "../extraction/documentExtractor";
+import { pdfAssetOptions } from "../extraction/pdfAssets";
 import type { PdfDocumentProxy, PdfLoadingTask } from "../extraction/pdfTypes";
 import type { BackendDecision } from "../extraction/quality";
 import { EspeakPhonemizer } from "../linguistics/espeakPhonemizer";
@@ -26,11 +27,17 @@ import type { EngineSettings, WorkerEvent, WorkerRequest } from "./protocol";
 
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
+/** Mirrors `DEFAULT_SETTINGS.initialAudioLead`; used when configure has not landed. */
+const DEFAULT_AUDIO_LEAD = 20;
+
 const store = new DocumentStore();
 let settings: EngineSettings | undefined;
 let engine: KokoroEngine | undefined;
+/** The in-flight `KokoroEngine.load`, so warming and importing share one load. */
+let engineLoad: Promise<KokoroEngine> | undefined;
 let coordinator: SynthesisCoordinator | undefined;
 let confirmResolver: ((proceed: boolean) => void) | undefined;
+let pdfAssetBase = "pdfjs/";
 
 function post(event: WorkerEvent, transfer: Transferable[] = []): void {
   (self as unknown as Worker).postMessage(event, transfer);
@@ -69,24 +76,68 @@ const emit = (event: CoordinatorEvent): void => {
   }
 };
 
-async function ensureEngine(): Promise<KokoroEngine> {
-  if (engine) return engine;
-  if (!settings) throw new PolyReadError("modelMissing", "the engine has not been configured");
-  const vocabulary = await loadVocabulary(settings.vocabUrl);
-  post({ type: "stage", stage: "Loading the voice model", done: 0, total: 1 });
-  engine = await KokoroEngine.load(
-    {
-      modelUrl: settings.modelUrl,
-      durationModelUrl: settings.durationModelUrl,
-      voicesBaseUrl: settings.voicesBaseUrl,
-      voiceID: settings.voiceID,
-      device: settings.device,
-      threads: settings.threads > 0 ? settings.threads : undefined,
-    },
-    vocabulary,
-    (label, loaded, total) => post({ type: "stage", stage: label, done: loaded, total }),
-  );
-  return engine;
+/**
+ * Loads the voice model, once, and hands every caller the same load.
+ *
+ * The model is a few hundred megabytes to fetch and compile, and it used to be
+ * started here — after extraction, after the phonemizer, at the point Phase A
+ * needed it. Everything before it was therefore dead time on a machine that
+ * could have been downloading, and the user's first sign that anything was
+ * happening at all came minutes in. `warmEngine` starts this the moment the
+ * worker is configured, so the load overlaps with reading the PDF instead of
+ * queueing behind it.
+ */
+function ensureEngine(): Promise<KokoroEngine> {
+  if (engine) return Promise.resolve(engine);
+  if (engineLoad) return engineLoad;
+  const configured = settings;
+  if (!configured) {
+    return Promise.reject(new PolyReadError("modelMissing", "the engine has not been configured"));
+  }
+
+  post({ type: "model", phase: "loading", label: "Loading the voice model", done: 0, total: 1 });
+  engineLoad = (async () => {
+    const vocabulary = await loadVocabulary(configured.vocabUrl);
+    const loaded = await KokoroEngine.load(
+      {
+        modelUrl: configured.modelUrl,
+        durationModelUrl: configured.durationModelUrl,
+        voicesBaseUrl: configured.voicesBaseUrl,
+        voiceID: configured.voiceID,
+        device: configured.device,
+        threads: configured.threads > 0 ? configured.threads : undefined,
+      },
+      vocabulary,
+      (label, done, total) => post({ type: "model", phase: "loading", label, done, total }),
+    );
+    engine = loaded;
+    post({ type: "model", phase: "ready", label: loaded.device, done: 1, total: 1 });
+    return loaded;
+  })();
+
+  engineLoad.catch((error: unknown) => {
+    // Cleared so the next attempt is a real retry rather than the same
+    // rejection handed out again.
+    engineLoad = undefined;
+    post({
+      type: "model",
+      phase: "failed",
+      label: error instanceof Error ? error.message : String(error),
+      done: 0,
+      total: 1,
+    });
+  });
+
+  return engineLoad;
+}
+
+/** Starts the load without making anyone wait for it, and without it throwing. */
+function warmEngine(): void {
+  if (!settings || engine || engineLoad) return;
+  void ensureEngine().catch(() => {
+    // `ensureEngine` has already reported it. A warm-up failing is not an
+    // import failing; the import will surface it when it asks for the engine.
+  });
 }
 
 interface OpenPdf {
@@ -97,17 +148,28 @@ interface OpenPdf {
 async function openPdf(bytes: ArrayBuffer): Promise<OpenPdf> {
   // pdf.js mutates the buffer it is handed, and the same bytes are hashed and
   // archived, so it gets a copy.
-  const task = pdfjs.getDocument({ data: new Uint8Array(bytes.slice(0)) }) as unknown as PdfLoadingTask;
+  const task = pdfjs.getDocument({
+    data: new Uint8Array(bytes.slice(0)),
+    ...pdfAssetOptions(pdfAssetBase),
+  }) as unknown as PdfLoadingTask;
   const document = await task.promise;
   return { document, close: () => task.destroy() };
 }
 
 async function runImport(bytes: ArrayBuffer, fileName: string, allowOcr: boolean): Promise<void> {
+  // Started before anything else and awaited at the last possible moment, so
+  // the download and the graph compile run underneath extraction rather than
+  // after it.
+  const engineReady = ensureEngine();
+  // Nothing awaits this until Phase A; without a handler an early rejection is
+  // an unhandled one.
+  engineReady.catch(() => undefined);
+
   const hash = await contentHash(bytes);
 
   const cached = await store.getSidecar(hash);
   if (cached && cached.version === SIDECAR_VERSION && cached.voiceName === settings?.voiceID) {
-    await resume(hash, cached);
+    await resume(hash, cached, engineReady);
     return;
   }
 
@@ -146,10 +208,11 @@ async function runImport(bytes: ArrayBuffer, fileName: string, allowOcr: boolean
     post({ type: "stage", stage: "Reading it out to itself", done, total }),
   );
 
-  const kokoro = await ensureEngine();
+  post({ type: "stage", stage: "Waiting for the voice model", done: 0, total: 1 });
+  const kokoro = await engineReady;
   coordinator?.cancel();
   coordinator = new SynthesisCoordinator(kokoro, {
-    initialAudioLead: settings?.initialAudioLead ?? 60,
+    initialAudioLead: settings?.initialAudioLead ?? DEFAULT_AUDIO_LEAD,
     onAudio: (chunkIndex, samples) => store.putAudio(hash, chunkIndex, samples),
   });
 
@@ -206,11 +269,15 @@ async function runImport(bytes: ArrayBuffer, fileName: string, allowOcr: boolean
   void coordinator.startPhaseB(emit);
 }
 
-async function resume(hash: string, sidecar: DocumentSidecar): Promise<void> {
-  const kokoro = await ensureEngine();
+async function resume(
+  hash: string,
+  sidecar: DocumentSidecar,
+  engineReady: Promise<KokoroEngine> = ensureEngine(),
+): Promise<void> {
+  const kokoro = await engineReady;
   coordinator?.cancel();
   coordinator = new SynthesisCoordinator(kokoro, {
-    initialAudioLead: settings?.initialAudioLead ?? 60,
+    initialAudioLead: settings?.initialAudioLead ?? DEFAULT_AUDIO_LEAD,
     onAudio: (chunkIndex, samples) => store.putAudio(hash, chunkIndex, samples),
   });
 
@@ -389,10 +456,17 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>): Promise<void> => {
           settings?.device !== message.settings.device ||
           settings?.threads !== message.settings.threads;
         settings = message.settings;
+        pdfAssetBase = message.pdfAssetBase;
         if (changed && engine) {
           await engine.dispose();
           engine = undefined;
+          engineLoad = undefined;
         }
+        // The app is unusable without the model, so the wait for it starts now
+        // rather than when a document is dropped. It is the same fetch either
+        // way; doing it here is the difference between the reader opening with
+        // audio behind it and opening onto silence.
+        warmEngine();
         break;
       }
       case "import":
