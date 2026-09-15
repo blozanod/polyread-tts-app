@@ -15,6 +15,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "assets": "node scripts/fetch-assets.mjs",
+    "fonts": "node scripts/fetch-fonts.mjs",
     "electron:build": "node scripts/build-electron.mjs",
     "desktop": "npm run desktop:check && npm run build && npm run electron:build && electron .",
     "dist": "npm run desktop:check && npm run build && npm run electron:build && electron-builder",
