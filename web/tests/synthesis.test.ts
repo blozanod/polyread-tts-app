@@ -250,3 +250,117 @@ describe("§7.4 audio storage", () => {
     expect(clipped[1]).toBe(-32767);
   });
 });
+
+/**
+ * `electron/main.ts` runs a local HTTP server for one reason: the COOP and COEP
+ * headers that make the page cross-origin isolated, which is what lets ONNX
+ * Runtime use more than one WASM thread. The engine was meanwhile pinning the
+ * thread count to one everywhere, so that server bought nothing and CPU
+ * synthesis ran about four times slower than the machine could manage.
+ */
+describe("wasm thread count", () => {
+  it("stays at one thread where SharedArrayBuffer is not available", async () => {
+    const { defaultThreadCount } = await import("../src/synthesis/kokoroEngine");
+    expect(defaultThreadCount(8, false)).toBe(1);
+    expect(defaultThreadCount(1, false)).toBe(1);
+  });
+
+  it("leaves a core free and caps at four where it is", async () => {
+    const { defaultThreadCount } = await import("../src/synthesis/kokoroEngine");
+    expect(defaultThreadCount(2, true)).toBe(1);
+    expect(defaultThreadCount(4, true)).toBe(3);
+    expect(defaultThreadCount(16, true)).toBe(4);
+    expect(defaultThreadCount(1, true)).toBe(1);
+  });
+});
+
+/**
+ * `ShaderModule with 'Clip' label is invalid` is what a GPU without 16-bit
+ * shader support says when it is handed an fp16 model: ONNX Runtime emits
+ * `enable f16;` only when the device has `shader-f16`, then generates `f16`
+ * WGSL anyway, so every shader it compiles is invalid and the error names
+ * whichever one came first. Clip has nothing to do with it.
+ *
+ * ONNX Runtime picks the adapter with a bare `requestAdapter()`, which on a
+ * laptop with two GPUs is usually the integrated one. Both halves of that are
+ * worth pinning down.
+ */
+describe("WebGPU adapter selection", () => {
+  const adapterWith = (features: string[], info?: Record<string, string>) => ({
+    features: { has: (f: string) => features.includes(f) },
+    info,
+  });
+
+  function gpuReturning(byPreference: Record<string, ReturnType<typeof adapterWith> | null>) {
+    return {
+      requestAdapter: (options?: { powerPreference?: string }) =>
+        Promise.resolve(byPreference[options?.powerPreference ?? "default"] ?? null),
+    };
+  }
+
+  it("prefers the discrete GPU when both can run the model", async () => {
+    const { selectAdapter } = await import("../src/synthesis/kokoroEngine");
+    const chosen = await selectAdapter(
+      gpuReturning({
+        "high-performance": adapterWith(["shader-f16"], { vendor: "nvidia", device: "RTX 3050" }),
+        "low-power": adapterWith(["shader-f16"], { vendor: "intel", device: "Iris Xe" }),
+      }) as never,
+    );
+    expect(chosen?.report.description).toContain("RTX 3050");
+    expect(chosen?.report.powerPreference).toBe("high-performance");
+    expect(chosen?.report.shaderF16).toBe(true);
+  });
+
+  it("takes the slower GPU over one that cannot run the model at all", async () => {
+    const { selectAdapter } = await import("../src/synthesis/kokoroEngine");
+    const chosen = await selectAdapter(
+      gpuReturning({
+        "high-performance": adapterWith([], { vendor: "nvidia", device: "RTX 3050" }),
+        "low-power": adapterWith(["shader-f16"], { vendor: "intel", device: "Iris Xe" }),
+      }) as never,
+    );
+    expect(chosen?.report.description).toContain("Iris Xe");
+    expect(chosen?.report.shaderF16).toBe(true);
+    expect(chosen?.report.hadChoice).toBe(true);
+  });
+
+  it("reports the shortfall when no adapter has 16-bit shaders", async () => {
+    const { selectAdapter, explainRejection } = await import("../src/synthesis/kokoroEngine");
+    const chosen = await selectAdapter(
+      gpuReturning({
+        "high-performance": adapterWith(["timestamp-query"], { vendor: "intel", device: "Iris Xe" }),
+        "low-power": adapterWith(["timestamp-query"], { vendor: "intel", device: "Iris Xe" }),
+      }) as never,
+    );
+    expect(chosen?.report.shaderF16).toBe(false);
+
+    // The message has to carry the remedy, because the remedy is a different
+    // model file rather than anything the person can change about their GPU.
+    const explained = explainRejection(
+      "webgpu",
+      "Failed to create a WebGPU compute pipeline: ShaderModule with 'Clip' label is invalid",
+      chosen?.report,
+    );
+    expect(explained).toContain("Iris Xe");
+    expect(explained).toContain("16-bit");
+    expect(explained).toContain("--dtype q8");
+  });
+
+  it("says nothing about f16 when the GPU has it and refused anyway", async () => {
+    const { explainRejection } = await import("../src/synthesis/kokoroEngine");
+    const explained = explainRejection("webgpu", "out of memory", {
+      description: "nvidia RTX 3050",
+      shaderF16: true,
+      powerPreference: "high-performance",
+      hadChoice: false,
+    });
+    expect(explained).toContain("out of memory");
+    expect(explained).not.toContain("--dtype");
+  });
+
+  it("leaves the choice to the browser when there is no WebGPU at all", async () => {
+    const { selectAdapter } = await import("../src/synthesis/kokoroEngine");
+    expect(await selectAdapter(undefined)).toBeUndefined();
+    expect(await selectAdapter(gpuReturning({}) as never)).toBeUndefined();
+  });
+});

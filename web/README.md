@@ -52,21 +52,25 @@ node scripts/fetch-assets.mjs --list
 
 Then pick a precision:
 
-| `--dtype` | Size | Use it when |
-|---|---|---|
-| `fp32` | 310 MB | You have WebGPU and want the best quality |
-| `fp16` | 156 MB | **Default.** Good on WebGPU, fine on CPU |
-| `q8f16` | 82 MB | The smallest one worth having |
-| `q8` | 88 MB | CPU only, or you care about download size |
-| `uint8f16` | 109 MB | |
-| `q4f16` | 147 MB | |
-| `uint8` | 169 MB | |
-| `q4` | 291 MB | |
+| `--dtype` | Size | Needs `shader-f16` | Use it when |
+|---|---|---|---|
+| `fp32` | 310 MB | no | Best quality, and runs on any WebGPU device |
+| `fp16` | 156 MB | **yes** | **Default.** Smaller and quicker where the GPU has 16-bit shaders |
+| `q8f16` | 82 MB | **yes** | The smallest one, where the GPU has 16-bit shaders |
+| `q8` | 88 MB | no | The smallest one that runs on any GPU, and the fastest on CPU |
+| `uint8f16` | 109 MB | **yes** | |
+| `q4f16` | 147 MB | **yes** | |
+| `uint8` | 169 MB | no | |
+| `q4` | 291 MB | no | |
 
 Those are the published sizes, not estimates. Note that the quantized files are
 not ordered the way the names suggest — `q4` is nearly twice `q4f16` and larger
-than `fp16`, because only some of the graph is quantized in each. If you want
-small, `q8f16` is the one.
+than `fp16`, because only some of the graph is quantized in each.
+
+The middle column is the one that decides whether the GPU is used at all: an
+`f16` file on a GPU whose driver does not expose 16-bit shader arithmetic falls
+back to the CPU, which is several times slower. Settings → Benchmark says which
+your GPU is; "If something goes wrong" below has the details.
 
 ```sh
 node scripts/fetch-assets.mjs --dtype q8f16     # smallest, fastest on CPU
@@ -111,9 +115,10 @@ Cross-Origin-Embedder-Policy: require-corp
 ```
 
 on that directory. Without them the multi-threaded CPU backend is not available
-at all. It is off by default anyway — see Settings → CPU threads, and the note
-in `src/synthesis/kokoroEngine.ts` about why — but the headers are what make
-turning it up possible on machines where it works.
+at all, and synthesis runs about four times slower than it needs to. With them
+PolyRead uses several threads by itself; the desktop builds serve themselves
+over a local HTTP server for no other reason than to send these two headers.
+Settings → CPU threads overrides the choice either way.
 
 ### Building the desktop apps
 
@@ -150,10 +155,18 @@ output, `waveform`. The duration predictor is still inside it, but an ONNX
 Runtime session will only hand back graph outputs, so there is no way to ask for
 it. That leaves two tiers, and the app tells you which one it is in:
 
-**Exact** — you ran `make-duration-model.py`. §7.2's Phase A works as specified:
-the whole document is timed before a single sample of audio is rendered, so the
-scrubber, the total duration and every word boundary are right immediately, and
-seeking anywhere is instant.
+**Exact** — you ran `make-duration-model.py`. Every word boundary comes from the
+model rather than from arithmetic, so the scrubber, the total duration and the
+highlight are all exact.
+
+The duration pass runs *behind* the reader rather than in front of it, which is
+a departure from §7.2 and a deliberate one: the subgraph is most of Kokoro's
+text encoder, and a document's worth of it on the CPU backend is several
+minutes — minutes spent staring at a loading bar instead of at the document the
+timeline is describing. So the reader opens on the estimated timeline
+immediately and the exact pass walks the document from the front, staying ahead
+of the audio, replacing each estimate before anything can reach it. The reader
+says "~" in front of the total for as long as any of it is still an estimate.
 
 **Estimated** — you did not. A chunk's *total* length is still known exactly the
 moment it is rendered (the waveform is `frames × 600` samples), so the timeline
@@ -315,14 +328,41 @@ is for that.
 **The import stops partway through loading the model.** ONNX Runtime's
 multi-threaded CPU backend starts its threads as workers, and the pipeline
 already runs in one — nested workers hang on some browser builds rather than
-failing. PolyRead ships with one thread for that reason, notices a stall after a
-minute and retries on one anyway. If you raised the thread count in Settings,
-put it back.
+failing. PolyRead only asks for more than one thread where the page is
+cross-origin isolated, which is the case they work in, and it notices a stall
+and retries on a single thread anyway. If you raised the thread count in
+Settings by hand, put it back.
 
 **It is slow.** Check Settings → Benchmark for which device it picked. WebGPU is
 several times faster than the CPU backend; if it says `wasm`, your browser
-either lacks WebGPU or refused it. Failing that, `--dtype q8` is the fastest
-model on CPU.
+either lacks WebGPU, refused it, or could not run this model on it — the last of
+those shows up as a note beside the import saying so. Failing that, `--dtype q8`
+is the fastest model on CPU.
+
+**`ShaderModule with 'Clip' label is invalid`, and it fell back to the CPU.**
+Clip has nothing to do with it. ONNX Runtime emits WGSL's `enable f16;` only
+when the GPU device reports the `shader-f16` feature, and then generates `f16`
+code for an fp16 model regardless — so on a GPU without 16-bit shader support
+*every* shader it compiles is invalid, and the error names whichever one was
+compiled first.
+
+The default model is fp16, so this is the combination to avoid. Either of the
+other two runs on any WebGPU device:
+
+```sh
+npm run assets -- --dtype q8      # 88 MB, and the fastest on CPU too
+npm run assets -- --dtype fp32    # 310 MB, best quality
+```
+
+Settings → Benchmark names the adapter and says whether it has 16-bit shaders,
+so you can check before downloading anything.
+
+**It picked the wrong GPU.** On a laptop with an integrated and a discrete GPU,
+`navigator.gpu.requestAdapter()` with no options — which is what ONNX Runtime
+asks for — usually returns the integrated one. PolyRead requests both power
+preferences itself and takes the discrete GPU, unless only the integrated one
+has 16-bit shader support, in which case being able to run the model wins over
+being faster at it. Settings → Benchmark says which it took.
 
 **A word is mispronounced.** Proper nouns route through eSpeak's letter-to-sound
 rules — Przeworski and Tocqueville come out about as well as you would expect.

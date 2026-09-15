@@ -16,6 +16,18 @@ import type { EngineInfo } from "../synthesis/kokoroEngine";
  * Everything crossing this boundary is structured-cloneable, which the §3 types
  * already are.
  */
+/**
+ * The label the model's graph compile reports under.
+ *
+ * It lives here, with the rest of the worker's vocabulary, because both sides
+ * read it: the engine reports it and `Session.checkForStall` keys its watchdog
+ * budget off it. Written out twice, a rename on one side would quietly restore
+ * the bug where a slow compile got the worker restarted from under itself. It
+ * must also stay out of `kokoroEngine.ts`, which the UI can only import types
+ * from — a value import there pulls all of ONNX Runtime onto the main thread.
+ */
+export const COMPILE_LABEL = "Preparing the model";
+
 export interface EngineSettings {
   modelUrl: string;
   durationModelUrl?: string;
@@ -89,9 +101,22 @@ export type WorkerEvent =
    */
   | { type: "priming"; seconds: number; target: number }
   | { type: "needsConfirmation"; decision: BackendDecision }
-  | { type: "ready"; document: ImportedDocument; engine: EngineInfo }
+  /**
+   * The reader, as soon as there is one. `engine` is absent when the voice
+   * model is still loading: §7.2's timeline needs no model, so the document
+   * opens on the estimated tier and `engine` follows on its own event rather
+   * than holding the reader shut behind a graph compile.
+   */
+  | { type: "ready"; document: ImportedDocument; engine?: EngineInfo }
+  | { type: "engine"; info: EngineInfo }
   | { type: "rendered"; chunkIndex: number; renderedThrough: number; totalChunks: number }
-  | { type: "timeline"; words: WordTiming[]; duration: number; chunkFrameOffsets: number[] }
+  | {
+      type: "timeline";
+      words: WordTiming[];
+      duration: number;
+      chunkFrameOffsets: number[];
+      footnoteTimelines?: Record<string, WordTiming[]>;
+    }
   | { type: "renderComplete" }
   | { type: "library"; entries: unknown[] }
   | { type: "usage"; audioBytes: number; quotaBytes?: number }

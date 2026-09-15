@@ -68,6 +68,27 @@ describe("pdf.js runtime assets", () => {
 });
 
 /**
+ * `onnxruntime-web` is 26 MB of WebAssembly and a few hundred kilobytes of
+ * JavaScript, and it belongs entirely to the pipeline worker. A single *value*
+ * imported from `kokoroEngine.ts` into anything the UI loads pulls the whole
+ * runtime onto the main thread — silently, as a bigger first paint rather than
+ * as an error.
+ */
+describe("main-thread bundle", () => {
+  it("imports the engine into the UI for its types only", () => {
+    const ui = join(here, "..", "src", "ui");
+    for (const name of readdirSync(ui)) {
+      if (!name.endsWith(".ts") && !name.endsWith(".tsx")) continue;
+      const source = readFileSync(join(ui, name), "utf8");
+      for (const line of source.split("\n")) {
+        if (!/from\s+["'][^"']*synthesis\/kokoroEngine["']/.test(line)) continue;
+        expect(line, `${name}: ${line.trim()}`).toMatch(/^import type |\{\s*type /);
+      }
+    }
+  });
+});
+
+/**
  * Pressing play on a fresh document starves on chunk 0 at the same moment Phase
  * B is rendering chunk 0. Both paths used to call the engine, so the one chunk
  * the listener was actually waiting for was rendered twice.
@@ -131,10 +152,11 @@ describe("§7.3 render scheduling", () => {
     const blocks = [blockOf("one two three"), blockOf("four five six")];
     const chunks = blocks.map(chunkFor);
     const { engine, renders } = slowEngine();
-    const coordinator = new SynthesisCoordinator(engine, {
+    const coordinator = new SynthesisCoordinator({
       initialAudioLead: 1,
       onAudio: () => undefined,
     });
+    coordinator.attachEngine(engine);
 
     await coordinator.runPhaseA(chunks, {}, blocks, () => undefined);
 
@@ -147,14 +169,159 @@ describe("§7.3 render scheduling", () => {
     expect(renders()).toBe(chunks.length);
   });
 
+  /** An engine with §7.2's exact tier, so refinement has something to do. */
+  function engineWithDurationModel(options: { failRenders?: number } = {}): {
+    engine: KokoroEngine;
+    durationCalls: () => number;
+    renders: () => number;
+  } {
+    let durationCalls = 0;
+    let renders = 0;
+    const engine = {
+      hasDurationModel: true,
+      timingSource: "model" as const,
+      durations: (chunk: PhonemizedChunk) => {
+        durationCalls += 1;
+        return Promise.resolve({
+          chunkID: chunk.id,
+          // Deliberately unlike the estimate, so a committed timing is visible.
+          frameDurations: chunk.tokens.map(() => 7).concat([7, 7]),
+          source: "model" as const,
+        });
+      },
+      render: async (chunk: PhonemizedChunk) => {
+        renders += 1;
+        if (renders <= (options.failRenders ?? 0)) throw new Error("OrtRun failed");
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        return {
+          samples: new Float32Array(600 * 7 * (chunk.tokens.length + 2)),
+          timing: {
+            chunkID: chunk.id,
+            frameDurations: chunk.tokens.map(() => 7).concat([7, 7]),
+            source: "model" as const,
+          },
+        };
+      },
+    };
+    return {
+      engine: engine as unknown as KokoroEngine,
+      durationCalls: () => durationCalls,
+      renders: () => renders,
+    };
+  }
+
+  it("opens the reader without waiting for the duration model", async () => {
+    const blocks = Array.from({ length: 40 }, (_, i) => blockOf(`block ${i} one two three`));
+    const chunks = blocks.map(chunkFor);
+    const { engine, durationCalls } = engineWithDurationModel();
+    const coordinator = new SynthesisCoordinator({
+      initialAudioLead: 1,
+      onAudio: () => undefined,
+    });
+
+    // §7.2 used to run the duration model over every chunk before anything
+    // reached the screen, which on the CPU backend was minutes of loading bar.
+    const phaseA = await coordinator.runPhaseA(chunks, {}, blocks, () => undefined);
+    expect(durationCalls()).toBe(0);
+    expect(phaseA.timingSource).toBe("estimated");
+    expect(phaseA.words.length).toBe(blocks.length * 5);
+    expect(phaseA.duration).toBeGreaterThan(0);
+
+    // The exact pass then runs behind the reader and firms the timeline up.
+    coordinator.attachEngine(engine);
+    await coordinator.startPhaseB(() => undefined);
+    expect(durationCalls()).toBeGreaterThan(0);
+    expect(coordinator.timingSource).toBe("model");
+  });
+
+  it("keeps the exact duration pass ahead of the audio", async () => {
+    const blocks = Array.from({ length: 12 }, (_, i) => blockOf(`block ${i} one two three`));
+    const chunks = blocks.map(chunkFor);
+    const { engine, durationCalls } = engineWithDurationModel();
+    const coordinator = new SynthesisCoordinator({
+      initialAudioLead: 1,
+      onAudio: () => undefined,
+    });
+    await coordinator.runPhaseA(chunks, {}, blocks, () => undefined);
+    coordinator.attachEngine(engine);
+
+    let renderedSoFar = 0;
+    const seen: Array<{ rendered: number; timed: number }> = [];
+    await coordinator.startPhaseB((event) => {
+      if (event.type !== "rendered") return;
+      renderedSoFar += 1;
+      seen.push({ rendered: renderedSoFar, timed: durationCalls() });
+    });
+
+    // Every chunk is timed before its audio is made, which is the whole point
+    // of §7.2 — a correct scrubber and seek ahead of the buffer edge.
+    for (const point of seen) expect(point.timed).toBeGreaterThanOrEqual(point.rendered);
+    expect(durationCalls()).toBe(chunks.length);
+  });
+
+  it("survives one chunk the model chokes on, and stops after a run of them", async () => {
+    const blocks = Array.from({ length: 6 }, (_, i) => blockOf(`block ${i} one two three`));
+    const chunks = blocks.map(chunkFor);
+
+    // One failure is a hole in the audio, not the end of the document. Phase B
+    // used to abandon the whole document on the first `OrtRun` error, which is
+    // how a GPU that could not compile one shader turned into a transport bar
+    // waiting forever for a chunk nobody was still rendering.
+    const single = engineWithDurationModel({ failRenders: 1 });
+    const survivor = new SynthesisCoordinator({ initialAudioLead: 1, onAudio: () => undefined });
+    await survivor.runPhaseA(chunks, {}, blocks, () => undefined);
+    survivor.attachEngine(single.engine);
+    let failures = 0;
+    await survivor.startPhaseB((event) => {
+      if (event.type === "failed") failures += 1;
+    });
+    expect(failures).toBe(0);
+    expect(survivor.progress.renderedChunks.size).toBe(chunks.length - 1);
+
+    const broken = engineWithDurationModel({ failRenders: 99 });
+    const doomed = new SynthesisCoordinator({ initialAudioLead: 1, onAudio: () => undefined });
+    await doomed.runPhaseA(chunks, {}, blocks, () => undefined);
+    doomed.attachEngine(broken.engine);
+    const messages: string[] = [];
+    await doomed.startPhaseB((event) => {
+      if (event.type === "failed") messages.push(event.message);
+    });
+    expect(messages.length).toBe(1);
+    expect(broken.renders()).toBe(3);
+  });
+
+  it("re-anchors a reopened timeline to the audio already on disk", async () => {
+    const blocks = Array.from({ length: 4 }, (_, i) => blockOf(`block ${i} one two three`));
+    const chunks = blocks.map(chunkFor);
+    const coordinator = new SynthesisCoordinator({ initialAudioLead: 1, onAudio: () => undefined });
+    const phaseA = await coordinator.runPhaseA(chunks, {}, blocks, () => undefined);
+
+    // Chunk 0's audio is on disk and is twice as long as Phase A guessed. The
+    // sidecar used to replay the guess, so every later chunk played from the
+    // wrong offset and the highlight drifted by the difference — for the whole
+    // document, on every reopen.
+    const guessed = phaseA.chunkFrameOffsets[1];
+    coordinator.adoptRendered([0], new Map([[0, guessed * 2]]));
+
+    const timeline = coordinator.snapshot();
+    expect(timeline.chunkFrameOffsets[1]).toBeGreaterThan(guessed);
+    expect(timeline.duration).toBeGreaterThan(phaseA.duration);
+    // The words move with the offsets rather than staying on Phase A's guess.
+    const firstOfSecondBlock = timeline.words.findIndex((w) => w.blockID === blocks[1].id);
+    expect(timeline.words[firstOfSecondBlock].start).toBeGreaterThan(
+      phaseA.words[firstOfSecondBlock].start,
+    );
+  });
+
   it("does not re-render a chunk that is already on disk", async () => {
     const blocks = [blockOf("one two three"), blockOf("four five six")];
     const chunks = blocks.map(chunkFor);
     const { engine, renders } = slowEngine();
-    const coordinator = new SynthesisCoordinator(engine, {
+    const coordinator = new SynthesisCoordinator({
       initialAudioLead: 1,
       onAudio: () => undefined,
     });
+    coordinator.attachEngine(engine);
 
     await coordinator.runPhaseA(chunks, {}, blocks, () => undefined);
     coordinator.adoptRendered([0]);

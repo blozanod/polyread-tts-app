@@ -41,6 +41,9 @@ export class AudioEngine {
   private available = new Set<number>();
   private provider: ChunkProvider | undefined;
   private feeding = false;
+  /** Set when a feed was asked for while one was running, with the time it wanted. */
+  private refeed = false;
+  private refeedTime = 0;
 
   private state: EngineState = { time: 0, playing: false, starved: false };
   onState: ((state: EngineState) => void) | undefined;
@@ -157,39 +160,91 @@ export class AudioEngine {
     await this.feedWindow(this.state.time);
   }
 
+  /**
+   * Fills the worklet's window around `time`.
+   *
+   * Re-entrant calls used to be dropped outright. During playback that was
+   * harmless — the next position message came ten milliseconds later — but a
+   * chunk landing while playback was *parked* on it arrived exactly once, and
+   * if that one call collided with a feed already in flight the audio the
+   * listener was waiting for never reached the worklet at all. So a collision
+   * now queues a repeat instead of discarding it.
+   */
   private async feedWindow(time: number): Promise<void> {
-    if (this.feeding || !this.provider || !this.node) return;
+    if (!this.provider || !this.node) return;
+    if (this.feeding) {
+      this.refeed = true;
+      this.refeedTime = time;
+      return;
+    }
     this.feeding = true;
     try {
-      const centre = samplesFromSeconds(time);
-      const ahead = centre + samplesFromSeconds(WINDOW_AHEAD_SECONDS);
-      const behind = centre - samplesFromSeconds(WINDOW_BEHIND_SECONDS);
-
-      for (let index = 0; index + 1 < this.chunkStarts.length; index++) {
-        const start = this.chunkStarts[index];
-        const end = this.chunkStarts[index + 1];
-        if (end < behind || start > ahead) {
-          this.delivered.delete(index);
-          continue;
-        }
-        if (this.delivered.has(index) || !this.available.has(index)) continue;
-        const samples = await this.provider(index);
-        if (!samples) continue;
-        this.delivered.add(index);
-        // The chunk's own audio starts after whatever silence introduces it; the
-        // gap is left as the zeros the worklet reads from a hole, which is
-        // exactly §5's "real silence inserted between rendered chunks".
-        const audioStart = end - samples.length;
-        const buffer = samples.buffer.slice(
-          samples.byteOffset,
-          samples.byteOffset + samples.byteLength,
-        );
-        this.node.port.postMessage({ type: "audio", start: audioStart, samples: buffer }, [buffer]);
-      }
-      this.node.port.postMessage({ type: "evictBefore", sample: behind });
+      let at = time;
+      do {
+        this.refeed = false;
+        await this.feedOnce(at);
+        at = this.refeedTime;
+      } while (this.refeed);
     } finally {
       this.feeding = false;
     }
+  }
+
+  private async feedOnce(time: number): Promise<void> {
+    const node = this.node;
+    const provider = this.provider;
+    if (!node || !provider) return;
+
+    const centre = samplesFromSeconds(time);
+    const ahead = centre + samplesFromSeconds(WINDOW_AHEAD_SECONDS);
+    const behind = centre - samplesFromSeconds(WINDOW_BEHIND_SECONDS);
+
+    // Only the chunks whose span meets the window. A book runs to thousands of
+    // them and this is called about a hundred times a second.
+    const first = Math.max(0, this.chunkIndexAtSample(behind));
+    for (let index = first; index + 1 < this.chunkStarts.length; index++) {
+      const start = this.chunkStarts[index];
+      const end = this.chunkStarts[index + 1];
+      if (start > ahead) break;
+      if (end < behind) continue;
+      if (this.delivered.has(index) || !this.available.has(index)) continue;
+      const samples = await provider(index);
+      if (!samples) continue;
+      this.delivered.add(index);
+      // The chunk's own audio starts after whatever silence introduces it; the
+      // gap is left as the zeros the worklet reads from a hole, which is
+      // exactly §5's "real silence inserted between rendered chunks".
+      const audioStart = end - samples.length;
+      const buffer = samples.buffer.slice(
+        samples.byteOffset,
+        samples.byteOffset + samples.byteLength,
+      );
+      node.port.postMessage({ type: "audio", start: audioStart, samples: buffer }, [buffer]);
+    }
+
+    // Anything that has fallen out of the window behind us can be handed back.
+    for (const index of this.delivered) {
+      const end = this.chunkStarts[index + 1];
+      const start = this.chunkStarts[index];
+      if (end === undefined || start === undefined || end < behind || start > ahead) {
+        this.delivered.delete(index);
+      }
+    }
+    node.port.postMessage({ type: "evictBefore", sample: behind });
+  }
+
+  /** Last chunk whose start is at or before `sample`; 0 when it is before them all. */
+  private chunkIndexAtSample(sample: number): number {
+    const starts = this.chunkStarts;
+    if (starts.length < 2 || sample <= starts[0]) return 0;
+    let lo = 0;
+    let hi = starts.length - 2;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (starts[mid] <= sample) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
   }
 
   async play(): Promise<void> {

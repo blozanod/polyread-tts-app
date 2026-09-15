@@ -32,13 +32,17 @@ import type { Phonemizer, PhonemizerCapabilities, PhonemizedWord } from "./phone
  *     *structurally* implies: a token with no letters or digits takes none, a
  *     token with digits may take many, an ordinary word takes one.
  *  4. Verify the solution token by token. If any token came out with a group
- *     count its structure forbids, discard the whole alignment and phonemize
- *     each token separately, which is 1:1 by construction and costs only
+ *     count its structure forbids, the alignment is discarded rather than
+ *     shipped.
+ *  5. Work out *which* tokens eSpeak ran together — it welds short function
+ *     words, so "of the" comes back as one `ʌvðə` — and phonemize only those
+ *     separately. If that cannot be localized either, every token is
+ *     phonemized separately, which is 1:1 by construction and costs only
  *     cross-word context.
  *
- * Step 4 is why this is allowed to exist at all: there is always a correct
- * answer to fall back to, so the DP is an optimization of *quality*, never a
- * load-bearing guess about *alignment*.
+ * Steps 4 and 5 are why this is allowed to exist at all: there is always a
+ * correct answer to fall back to, so the DP is an optimization of *quality*,
+ * never a load-bearing guess about *alignment*.
  */
 
 type EspeakFn = (text: string, language?: string) => Promise<string[]>;
@@ -90,14 +94,63 @@ export class EspeakPhonemizer implements Phonemizer {
     if (groups.length === tokens.length) {
       phonemes = groups;
     } else {
-      const aligned = alignGroupsToTokens(tokens, groups);
-      phonemes = aligned ?? (await this.phonemizeEachToken(tokens));
+      phonemes = (await this.repairAlignment(tokens, groups)) ?? (await this.phonemizeEachToken(tokens));
     }
 
     return tokens.map((token, i) => ({
       token,
       phonemes: this.override(token, posTags[i]) ?? phonemes[i] ?? "",
     }));
+  }
+
+  /**
+   * Rescues the context-sensitive pass when eSpeak has welded two tokens into
+   * one group.
+   *
+   * This is the common failure, not an exotic one: eSpeak runs short function
+   * words together, so "of the" comes back as `ʌvðə` and "that the" as `ðætðə`,
+   * and roughly half the paragraphs in ordinary academic prose contain at least
+   * one. Step 4's verification correctly refuses that alignment — there is no
+   * honest way to say where inside `ʌvðə` the word boundary is — but discarding
+   * the *whole* paragraph over it threw away the cross-word context for every
+   * other word in it and paid for a separate eSpeak pass per token, which is
+   * the slowest path in §6 by a wide margin.
+   *
+   * So the merged run is located and only its tokens are re-phonemized. A
+   * token's phonemes still come from one place or the other, never from a guess
+   * about how to cut a group in half, and §0.3's 1:1 guarantee is unchanged.
+   */
+  private async repairAlignment(
+    tokens: readonly string[],
+    groups: readonly string[],
+  ): Promise<string[] | undefined> {
+    const strict = alignTokens(tokens, groups);
+    if (strict) return strict.phonemes;
+    if (groups.length >= tokens.length) return undefined;
+
+    const loose = alignTokens(tokens, groups, { allowMerges: true });
+    if (!loose) return undefined;
+
+    // A run is a token that took a group followed by the tokens that took none.
+    const suspect = new Set<number>();
+    for (let i = 0; i < tokens.length; i++) {
+      if (loose.counts[i] !== 0) continue;
+      suspect.add(i);
+      for (let j = i - 1; j >= 0; j--) {
+        suspect.add(j);
+        if (loose.counts[j] !== 0) break;
+      }
+    }
+    // Nothing worth keeping if the merge touched most of the paragraph.
+    if (suspect.size > tokens.length / 2) return undefined;
+
+    const indices = [...suspect].sort((a, b) => a - b);
+    const redone = await this.phonemizeEachToken(indices.map((i) => tokens[i]));
+    const out = [...loose.phonemes];
+    indices.forEach((index, at) => {
+      out[index] = redone[at] ?? "";
+    });
+    return out;
   }
 
   /**
@@ -215,11 +268,41 @@ export function alignGroupsToTokens(
   tokens: readonly string[],
   groups: readonly string[],
 ): string[] | undefined {
+  return alignTokens(tokens, groups)?.phonemes;
+}
+
+export interface Alignment {
+  phonemes: string[];
+  /** How many groups each token took; 0 means eSpeak merged it into a neighbour. */
+  counts: number[];
+}
+
+/**
+ * The alignment itself.
+ *
+ * `allowMerges` lets a token take no groups at all, which is never a shippable
+ * answer on its own — a word with no phonemes has no duration — but does
+ * identify *which* tokens eSpeak ran together so the caller can re-do just
+ * those. The strict mode is the one whose output can be used directly.
+ */
+export function alignTokens(
+  tokens: readonly string[],
+  groups: readonly string[],
+  options: { allowMerges?: boolean } = {},
+): Alignment | undefined {
   const n = tokens.length;
   const m = groups.length;
-  if (n === 0) return [];
+  if (n === 0) return { phonemes: [], counts: [] };
+  // The table below is (n+1) x (m+1); a runaway OCR block with thousands of
+  // both would allocate hundreds of megabytes for an answer nobody can trust
+  // anyway. Per-token phonemization is 1:1 by construction, so it is the right
+  // answer here rather than a fallback.
+  if (n * m > 4_000_000) return undefined;
 
-  const ranges = tokens.map(allowedGroupRange);
+  const ranges = tokens.map((token) => {
+    const range = allowedGroupRange(token);
+    return options.allowMerges && range.max > 0 ? { ...range, min: 0 } : range;
+  });
   const estimates = tokens.map(estimatePhonemeCount);
 
   // Prefix sums of group segment counts, so scoring a run is O(1).
@@ -281,5 +364,5 @@ export function alignGroupsToTokens(
     out.push(groups.slice(cursor, cursor + g).join(""));
     cursor += g;
   }
-  return out;
+  return { phonemes: out, counts };
 }
