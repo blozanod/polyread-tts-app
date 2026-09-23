@@ -39,7 +39,8 @@ later installs — `git checkout package.json package-lock.json` undoes it if yo
 would rather keep the committed state lean. The `dist:*` scripts check for the
 toolchain and point you here if it is missing.
 
-`npm run assets` is a one-time download of about 170 MB. **The same files serve
+`npm run assets` is a one-time download of about 480 MB: the model twice, at
+two precisions, for reasons in the next section. **The same files serve
 the website and the desktop installers** — it writes into `public/models/`, Vite
 copies that into `dist/` at build time, and electron-builder packages `dist/`.
 One download, both targets, no second set of files to manage.
@@ -50,39 +51,34 @@ To see exactly what is published before committing to a download:
 node scripts/fetch-assets.mjs --list
 ```
 
-Then pick a precision:
+By default that is two model files, one for each processor:
 
-| `--dtype` | Size | Needs `shader-f16` | Use it when |
-|---|---|---|---|
-| `fp32` | 310 MB | no | Best quality, and runs on any WebGPU device |
-| `fp16` | 156 MB | **yes** | **Default.** Smaller and quicker where the GPU has 16-bit shaders |
-| `q8f16` | 82 MB | **yes** | The smallest one, where the GPU has 16-bit shaders |
-| `q8` | 88 MB | no | The smallest one that runs on any GPU, and the fastest on CPU |
-| `uint8f16` | 109 MB | **yes** | |
-| `q4f16` | 147 MB | **yes** | |
-| `uint8` | 169 MB | no | |
-| `q4` | 291 MB | no | |
+| File | Precision | Size | Runs on | Why |
+|---|---|---|---|---|
+| `kokoro-gpu.onnx` | `fp32` | 310 MB | the GPU, first | kokoro-js, the reference client for this checkpoint, recommends fp32 on WebGPU: at half precision the vocoder is audibly worse, and some drivers refuse the graph |
+| `kokoro.onnx` | `fp16` | 156 MB | the CPU, and a GPU that refuses fp32 | The fastest file on the CPU backend |
 
-Those are the published sizes, not estimates. Note that the quantized files are
-not ordered the way the names suggest — `q4` is nearly twice `q4f16` and larger
-than `fp16`, because only some of the graph is quantized in each.
+The CPU numbers, measured on the same four-core machine with onnxruntime-web's
+own WebAssembly build: `fp16` 1.35× realtime on four threads, `fp32` 1.19×, and
+`q8` 0.72× — its integer kernels do not use the thread pool. On one thread all
+three are near 0.4×, which is why threads matter more than the file (see
+[Building the site](#building-the-site)).
 
-The middle column is the one that decides whether a *given* GPU can run a given
-file: a driver that does not expose 16-bit shader arithmetic cannot run an `f16`
-model at all. It is no longer the column that decides whether the GPU is used,
-though, because `--gpu-fallback` fetches an `fp32` copy alongside whatever you
-chose and PolyRead loads that on the GPU rather than moving to the CPU:
+The browser only downloads the file its first rung will run, so neither kind of
+machine fetches both. To choose differently:
 
 ```sh
-node scripts/fetch-assets.mjs --gpu-fallback    # + fp32 spare, so the GPU is kept
-node scripts/fetch-assets.mjs --dtype q8f16     # smallest, fastest on CPU
-node scripts/fetch-assets.mjs --voices all      # all 55 voices, +28 MB
-node scripts/fetch-assets.mjs --voices-from-npm # voices from npm, if the Hub is blocked
+node scripts/fetch-assets.mjs --no-gpu-model      # fp16 only, 156 MB; the GPU runs it too
+node scripts/fetch-assets.mjs --dtype q8f16       # a smaller file for the CPU
+node scripts/fetch-assets.mjs --voices all        # all 55 voices, +28 MB
+node scripts/fetch-assets.mjs --voices-from-npm   # voices from npm, if the Hub is blocked
 ```
 
-On a machine with a GPU that refuses fp16, that costs 310 MB of disk and buys
-back the several-fold difference between GPU and CPU synthesis. Settings →
-Benchmark prints the whole ladder — every device tried, and what each said.
+`--dtype` accepts `fp32`, `fp16`, `q8`, `q8f16`, `q4`, `q4f16`, `uint8` and
+`uint8f16`, or a filename from `--list`; `--gpu-dtype` does the same for the GPU
+file. Files ending `f16` need a GPU with `shader-f16`. Note that the quantized
+files are not ordered the way the names suggest — `q4` is nearly twice `q4f16`
+and larger than `fp16`, because only some of the graph is quantized in each.
 
 If a dtype name does not match anything the repository has, the script prints
 every model file it found so you can pass one by name.
@@ -113,18 +109,22 @@ npm run build        # -> dist/
 fine. `public/models` is copied into `dist/models`, so whatever you fetched ships
 with it.
 
-One optional server tweak: if you can set response headers, send
+Threads on the CPU need a cross-origin-isolated page, which takes two response
+headers. If you can set them, send
 
 ```
 Cross-Origin-Opener-Policy: same-origin
 Cross-Origin-Embedder-Policy: require-corp
 ```
 
-on that directory. Without them the multi-threaded CPU backend is not available
-at all, and synthesis runs about four times slower than it needs to. With them
-PolyRead uses several threads by itself; the desktop builds serve themselves
-over a local HTTP server for no other reason than to send these two headers.
-Settings → CPU threads overrides the choice either way.
+on that directory. If you cannot — GitHub Pages and most personal hosts do not
+let you — nothing needs doing: `public/isolation-sw.js` is a service worker that
+adds them to the app's own responses, and the first visit reloads once to come
+under it. It caches nothing and touches nothing but this app's files. Without
+isolation of either kind the CPU backend has one thread, and one thread renders
+at about 0.4× realtime — slower than the voice speaks. The desktop builds serve
+themselves over a local HTTP server for no other reason than to send these two
+headers. Settings → CPU threads overrides the thread count either way.
 
 ### Building the desktop apps
 
@@ -162,7 +162,8 @@ what happens when there is no other answer left.
 proven by *running* the graph rather than merely compiling it, because WebGPU
 compiles a shader the first time an operator runs and not before:
 
-1. **Every GPU the machine will hand out**, best first. Adapters are probed at
+1. **Every GPU the machine will hand out**, best first, each with the
+   full-precision model and then the half-precision one. Adapters are probed at
    all three request shapes and ranked: discrete before integrated, NVIDIA first
    among discrete, anything that can run the model before anything that cannot.
    Software rasterizers (SwiftShader, lavapipe, WARP) are dropped rather than
@@ -171,11 +172,7 @@ compiles a shader the first time an operator runs and not before:
 2. **The best GPU with graph fusions off.** ORT's WebGPU shader generation is
    thinnest around its fused kernels; a driver that refuses one will usually run
    the same graph unfused, and that is still a GPU.
-3. **A model file a GPU is known to accept**, if `--gpu-fallback` fetched one.
-   An fp16 model is the fastest thing a GPU can run and the one thing some
-   drivers will not run at all, and the remedy for that is a different file, not
-   a different processor.
-4. **The CPU** — and reaching it is never silent. It raises a card on the
+3. **The CPU**, on the half-precision model — and reaching it is never silent. It raises a card on the
    library page that names the GPU, the reason, and the one command that would
    have kept it on the GPU.
 
@@ -188,7 +185,7 @@ option — which is the only path `onnxruntime-web` honours, and why the previou
 starts, since the renderer can only rank adapters Chromium already initialized.
 
 Settings → Compute chooses between **GPU first** (the default: the ladder above),
-**GPU only** (the same ladder with step 4 removed, so a machine that cannot use
+**GPU only** (the same ladder with step 3 removed, so a machine that cannot use
 its GPU says so instead of quietly running ten times slower) and **CPU**.
 Settings → Benchmark prints the whole ladder, rung by rung, with what each said.
 
@@ -248,27 +245,38 @@ src/workers       The thread boundary the web adds.
 Eight things are genuinely different. Each is argued where it lives in the
 source; this is the index.
 
-**1. The phoneme vocabulary had a bug, and it is fixed.**
+**1. The phoneme vocabulary is the checkpoint's own.**
 `src/linguistics/vocabulary.ts`. The Swift build shipped a reconstruction of
-Kokoro's symbol list and said loudly that it had never been checked against a
-real model. It was missing one character — an apostrophe, second from the end of
-the IPA run. That shifted `ᵻ` down by one and dropped `'` entirely, and eSpeak
-emits `ᵻ` in every unstressed *-es* and *-ed*. The corrected table is checked
-against the reference implementation and pinned by a test.
+Kokoro's symbol list, and a first correction of it here was still wrong: both
+enumerated v0.19's symbol string, whose tail repeats an apostrophe, so `ᵻ` —
+the vowel eSpeak writes in nearly every unstressed *-es* and *-ed* — was sent
+as 175 when v1.0 has it at 177, and 175 is a slot the model never trained. The
+table is now v1.0's `config.json` vocabulary verbatim, pinned id for id by a
+test. The loaded `tokenizer.json`, when present, is what the chunker encodes
+with; it used to be read and then not passed to it.
 
-**2. §0.3 is answered, and the answer is enforced rather than assumed.**
+**2. §0.3 is answered, and the voice hears what the reference client sends.**
 `src/linguistics/espeakPhonemizer.ts`. MisakiSwift was never evaluated; the web
-uses eSpeak-NG compiled to WebAssembly, which is the same G2P the reference
-Kokoro web client uses. It resolves homographs from context — *the record shows*
-against *they record the vote* — but its word boundaries are its own: "1993"
-comes back as three groups and a bare "(" as none. So the block is phonemized
-once for context, and where the group count does not match the token count a
-monotonic dynamic program assigns each token a run of groups, scored against
-what the token structurally implies. The result is then *verified*, and if any
-token came out with a group count its structure forbids, the whole alignment is
-thrown away and each token is phonemized separately, which is one-to-one by
-construction. There is always a correct fallback, so the clever part is an
-optimization of pronunciation quality and never a guess about alignment.
+uses eSpeak-NG, which is the same G2P the reference Kokoro web client uses. It
+resolves homographs from context — *the record shows* against *they record the
+vote* — but its word boundaries are its own: "1993" comes back as three groups,
+"of the" as one. So each passage is phonemized as running text, exactly as
+kokoro-js does it, and that string goes to the model unchanged; only its
+*division* among the tokens is solved for, by a monotonic alignment in which a
+number may take several groups, several short words may share one, and a bare
+dash may take none. Words that share a group are marked `joined` and encoded
+with no space between them, so the stream is byte-for-byte kokoro-js's. The
+alignment checks that each word's phonemes can begin the way it is spelled,
+which keeps one miscount from sliding every later word onto its neighbour. A
+misplaced cut inside `ʌvðə` moves a highlight by milliseconds and never changes
+a sound. The previous version re-phonemized welded words one at a time, which
+read "a" as the letter *A* and gave every "the" full stress, and it sometimes
+kept both copies of a weld, so "on the" was spoken "on on-the".
+
+Passages go to eSpeak on a small pool of workers (`phonemizerPool.ts`): the
+`phonemizer` package is eSpeak compiled to plain JavaScript and makes its
+phonemes by running the synthesizer, about a millisecond a word, and it was the
+longest stage of an import.
 
 **3. §4.2 scores function words, not dictionary hits.**
 `src/extraction/quality.ts`. There is no `UITextChecker` here, and a 275 KB
@@ -276,12 +284,27 @@ English word list is both a download and the wrong instrument for a corpus of
 Przeworski and Tocqueville. English prose is about 45% function words; a corrupt
 OCR layer is near zero, and no proper noun is ever mistaken for one.
 
-**4. pdf.js text items are cut into words.** `src/extraction/backends.ts`.
-pdf.js emits a run per show-text operator, which can be a whole line. §4.4 and
-§4.5 classify individual words, so items are split at their spaces with the width
-divided by character count. The vertical measurements the footnote-marker test
-actually depends on — `glyphHeight` and `baseline` — come from the item itself
-and stay exact.
+**4. Words, lines and columns are rebuilt from pdf.js's items.**
+`src/extraction/words.ts`, `pageLayout.ts`, `blockAssembler.ts`. pdf.js emits a
+text item per run of one font, which can be a whole line or part of a word.
+Pieces with no space and no visible gap between them are joined into one word
+(small caps, an italic word's roman period, a TeX accent over its letter), text
+struck twice for a bold effect is dropped, and rotated text is left out. Words
+are then chained into line segments that stop at any gap wider than an em — a
+gutter, never a word space — and a page's columns are found as a vertical strip
+that column-shaped text stands either side of, with whatever crosses it (title,
+abstract, a wide caption) read as a band of its own. Paragraphs break at a gap,
+at an indent from a margin fitted through the lines (so a scan's skew is not an
+indent), and where a run of lines set in together — a block quote, a centred
+title — returns to the margin, never on each of their lines. They continue
+across a column or a page break, past the page's running head. The vertical
+measurements the footnote-marker test depends on — `glyphHeight` and
+`baseline` — come from the items themselves and stay exact.
+
+`scripts/make-layout-fixtures.py` typesets a book chapter, a two-column journal
+article, a skewed per-word OCR layer and a fake-bold chapter whose correct
+reading is known exactly; `tests/layouts.test.ts` holds the extractor to them
+paragraph for paragraph.
 
 **5. The layout can move, and only ever ahead of the playhead.**
 `src/synthesis/streamLayout.ts`. On iOS, Phase A knew every chunk's frame count
@@ -331,12 +354,13 @@ place — but tapping one currently does nothing.
 npm test
 ```
 
-74 tests in about two seconds. Most are unit tests over the parts that need
+146 tests in a few seconds. Most are unit tests over the parts that need
 neither a GPU nor a PDF: frame arithmetic, the §5 span invariant through every
-substitution, §4.3–§4.6 layout on synthetic geometry, the §6.2 budget and
-sentence backoff, the phoneme vocabulary against the checkpoint's ids, §0.3 word
-grouping over the cases that break it, and the duration estimator's exactness
-properties.
+substitution, §4.3–§4.6 layout on synthetic geometry, sentence-aligned §6.2
+chunking, the phoneme vocabulary against the checkpoint's ids, §0.3 word
+alignment over the cases that break it, and the duration estimator's exactness
+properties. Four more read the typeset layout fixtures (see §4 above) through
+the real pdf.js.
 
 Two of them are §13's integration gates, run against a hand-built two-page PDF
 in `tests/fixtures/` that carries one of everything §4 has a rule for — a
@@ -353,7 +377,7 @@ They cannot run the model or the browser. That half was verified by driving the
 built site in headless Chromium against a stand-in model with Kokoro's exact
 interface. `scripts/make-test-model.py` writes one — a tone generator, so the
 pipeline is real and only the sound is a lie — which is also the quickest way to
-work on the reader without a 170 MB download:
+work on the reader without a 480 MB download:
 
 ```sh
 python3 -m pip install onnx numpy
@@ -376,13 +400,14 @@ is for that.
 
 ## If something goes wrong
 
-**The import stops partway through loading the model.** ONNX Runtime's
-multi-threaded CPU backend starts its threads as workers, and the pipeline
-already runs in one — nested workers hang on some browser builds rather than
-failing. PolyRead only asks for more than one thread where the page is
-cross-origin isolated, which is the case they work in, and it notices a stall
-and retries on a single thread anyway. If you raised the thread count in
-Settings by hand, put it back.
+**The import stops partway through loading the model.** This used to happen on
+every cross-origin-isolated page of a production build, and it was not the
+browser. ONNX Runtime starts its CPU threads from its own script's URL, and once
+Vite bundles it into the pipeline worker that URL is the pipeline worker, whose
+message handler then replaced the one each thread runs on. The pipeline now
+leaves a runtime thread alone (`isRuntimeThread` in `pipeline.worker.ts`). The
+stall watchdog that retries on a single thread is still there for anything
+else that hangs.
 
 **It is slow.** Check Settings → Benchmark for which device it picked, and for
 the ladder underneath it — every rung tried, in order, with what each one said.
@@ -410,10 +435,11 @@ adapter's real limits rather than the spec's 256 MB default, which is the other
 half of that error message — and passes it to the session as the WebGPU
 provider's `device` option, which is the one path ONNX Runtime honours. If a
 device genuinely cannot do 16-bit arithmetic, the remedy is a model file rather
-than a GPU:
+than a GPU — the full-precision one, which `npm run assets` fetches by default
+and every GPU tries first:
 
 ```sh
-npm run assets -- --gpu-fallback  # fp32 spare, loaded on the GPU automatically
+npm run assets   # includes kokoro-gpu.onnx, fp32, 310 MB
 ```
 
 **It picked the wrong GPU.** On a laptop with an integrated and a discrete GPU,

@@ -366,10 +366,18 @@ export class Session {
         if (this.pendingOnDemand === event.chunkIndex) this.pendingOnDemand = -1;
         void this.audio.chunkRendered(event.chunkIndex);
         this.patch({ renderedThrough: event.renderedThrough });
-        if (this.resumeWhenRendered === event.chunkIndex) {
-          this.resumeWhenRendered = -1;
-          this.patch({ waitingForAudio: false });
-          void this.play();
+        if (this.resumeWhenRendered >= 0) {
+          const parked = this.resumeWhenRendered;
+          if (this.readyToResume(parked)) {
+            this.resumeWhenRendered = -1;
+            this.patch({ waitingForAudio: false });
+            void this.play();
+          } else if (event.chunkIndex === parked && this.pendingOnDemand !== parked + 1) {
+            // After a seek far ahead of Phase B the next chunk would not come
+            // for a long while; ask for it now, one request at a time.
+            this.pendingOnDemand = parked + 1;
+            this.send({ type: "renderNow", chunkIndex: parked + 1 });
+          }
         }
         break;
 
@@ -448,6 +456,21 @@ export class Session {
         break;
       }
     }
+  }
+
+  /**
+   * Whether playback parked on `index` may start again.
+   *
+   * Once playback has had to stop and wait, it waits for the chunk after the
+   * one it stopped on as well. Resuming the moment the missing chunk lands, on
+   * a machine that renders at about the speed it plays, meant stopping again
+   * at the end of that chunk, and again after the next: a stutter every few
+   * seconds. One chunk of lead in hand turns that into a single pause.
+   */
+  private readyToResume(index: number): boolean {
+    if (!this.rendered.has(index)) return false;
+    const last = this.chunkStartSamples.length - 2;
+    return index >= last || this.rendered.has(index + 1);
   }
 
   private applyOffsets(chunkFrameOffsets: readonly number[]): void {
