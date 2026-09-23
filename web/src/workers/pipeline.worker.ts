@@ -284,13 +284,27 @@ async function importDocument(
   );
 
   const language = espeakLanguageFor(settings?.voiceID ?? "af_heart");
-  const linguistics = new LinguisticsPipeline(new EspeakPhonemizer(language));
+  // The chunks carry token ids, and those ids are what the model is fed. They
+  // have to come from the same vocabulary the model was loaded with — building
+  // the pipeline without it encoded every document with the built-in table,
+  // whatever `tokenizer.json` said.
+  const vocabulary = await vocabularyForSettings();
+  const linguistics = new LinguisticsPipeline(new EspeakPhonemizer(language), vocabulary);
   const analysed = await linguistics.run(extraction.blocks, (done, total) =>
     post({ type: "stage", stage: "Reading it out to itself", done, total }),
   );
 
   coordinator?.cancel();
-  coordinator = newCoordinator(hash, await vocabularyForSettings());
+  coordinator = newCoordinator(hash, vocabulary);
+  // A fresh import mints fresh chunks, so any audio still filed under this
+  // PDF's hash belongs to chunks that no longer exist — an older pipeline, or
+  // another voice. Left in place, a later reopen adopts it as rendered and
+  // plays one version's audio against the other's timeline.
+  try {
+    await store.removeAudio(hash);
+  } catch {
+    // Only the cache; Phase B overwrites what it renders either way.
+  }
 
   const phaseA = await coordinator.runPhaseA(
     analysed.mainChunks,
@@ -653,7 +667,7 @@ async function benchmark(): Promise<string> {
   const spaceID = vocab.spaceID;
   while (ids.length < 480) {
     for (const word of filler) {
-      if (ids.length > 0 && spaceID !== undefined) ids.push(spaceID);
+      if (ids.length > 0 && spaceID !== undefined && !word.joined) ids.push(spaceID);
       ids.push(...vocab.encode(word.phonemes).tokens);
       if (ids.length >= 480) break;
     }

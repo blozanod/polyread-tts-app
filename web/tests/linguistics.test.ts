@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { tokensOf } from "../src/core/spanInvariant";
 import { newID, textRange, type Block } from "../src/core/types";
-import { BUDGET, Chunker, isSentenceEnd, splitChunks } from "../src/linguistics/chunker";
+import { BUDGET, Chunker, isSentenceEnd, MIN_CHUNK, splitChunks, TARGET } from "../src/linguistics/chunker";
 import {
-  alignGroupsToTokens,
-  alignTokens,
-  allowedGroupRange,
+  alignContextual,
+  divideGroup,
   EspeakPhonemizer,
+  opensLike,
+  passages,
 } from "../src/linguistics/espeakPhonemizer";
 import { unencodableEntries, homographPhonemes } from "../src/linguistics/homographs";
 import { normalizeText, postProcessPhonemes, splitOnPunctuation } from "../src/linguistics/kokoroText";
@@ -139,75 +140,100 @@ describe("§6.1 phonemizer", () => {
 });
 
 describe("word alignment", () => {
-  it("lets a number take several groups and punctuation take none", () => {
-    expect(allowedGroupRange("1993")).toMatchObject({ min: 1, max: 8 });
-    expect(allowedGroupRange("(")).toMatchObject({ min: 0, max: 0 });
-    expect(allowedGroupRange("nation-state")).toMatchObject({ min: 1, max: 4 });
-    expect(allowedGroupRange("elite")).toMatchObject({ min: 1, max: 2 });
-  });
-
   it("assigns the expanded groups of a number to the number", () => {
     const tokens = ["in", "1993", "the", "assembly"];
-    const groups = ["ɪn", "nˈaɪntiːn", "hˈʌndɹɪd", "nˈaɪnti", "θɹˈiː", "ðə", "ɐsˈɛmbli"];
-    const aligned = alignGroupsToTokens(tokens, groups);
-    expect(aligned).toBeDefined();
-    expect(aligned!.length).toBe(4);
-    expect(aligned![0]).toBe("ɪn");
-    expect(aligned![1]).toBe("nˈaɪntiːnhˈʌndɹɪdnˈaɪntiθɹˈiː");
-    expect(aligned![3]).toBe("ɐsˈɛmbli");
+    const groups = ["ɪn", "nˈaɪntiːn", "nˈaɪndi", "θɹˈiː", "ðɪ", "ɐsˈɛmbli"];
+    const aligned = alignContextual(tokens, groups);
+    expect(aligned?.map((w) => w.phonemes)).toEqual(["ɪn", "nˈaɪntiːn nˈaɪndi θɹˈiː", "ðɪ", "ɐsˈɛmbli"]);
   });
 
-  it("gives a punctuation-only token an empty group", () => {
-    const aligned = alignGroupsToTokens(["—", "elite"], ["ɪlˈiːt"]);
-    expect(aligned).toEqual(["", "ɪlˈiːt"]);
+  it("gives a punctuation-only token no phonemes and keeps the dash in the stream", () => {
+    const aligned = alignContextual(["elite", "—", "mass"], ["ɪlˈiːt", "—", "mˈæs"]);
+    expect(aligned?.map((w) => w.phonemes)).toEqual(["ɪlˈiːt", "—", "mˈæs"]);
+    const bare = alignContextual(["—", "elite"], ["ɪlˈiːt"]);
+    expect(bare?.map((w) => w.phonemes)).toEqual(["", "ɪlˈiːt"]);
   });
 
-  it("refuses rather than inventing an alignment it cannot justify", () => {
-    // Four ordinary words and twenty groups: no assignment respects the
-    // structural ranges, so the caller must fall back to per-token.
-    expect(alignGroupsToTokens(["a", "b", "c", "d"], Array.from({ length: 20 }, () => "x"))).toBeUndefined();
-  });
-
-  it("names the tokens eSpeak welded together instead of only refusing", () => {
-    // eSpeak runs short function words into one group: "of the" comes back as
-    // a single `ʌvðə`. Strictly there is no alignment, and the merge-aware pass
-    // is what says *which* two tokens to redo rather than the whole paragraph.
+  it("divides a weld between the words that share it instead of re-reading them", () => {
+    // eSpeak runs short function words into one group: "of the" is a single
+    // `ʌvðə`. The old repair re-phonemized the pair in isolation — a stressed
+    // citation "the" — and as often as not kept the weld as well, so the pair
+    // was spoken twice. The group now stays exactly as eSpeak wrote it.
     const tokens = ["the", "vote", "of", "the", "assembly"];
     const groups = ["ðə", "vˈoʊt", "ʌvðə", "ɐsˈɛmbli"];
-    expect(alignGroupsToTokens(tokens, groups)).toBeUndefined();
-
-    const loose = alignTokens(tokens, groups, { allowMerges: true });
-    expect(loose).toBeDefined();
-    expect(loose!.counts.reduce((a, b) => a + b, 0)).toBe(groups.length);
-    expect(loose!.counts.filter((c) => c === 0).length).toBe(1);
+    const aligned = alignContextual(tokens, groups)!;
+    expect(aligned.map((w) => w.phonemes)).toEqual(["ðə", "vˈoʊt", "ʌv", "ðə", "ɐsˈɛmbli"]);
+    expect(aligned.map((w) => w.joined)).toEqual([false, false, false, true, false]);
   });
 
-  it("refuses a table too large to be worth solving", () => {
-    // A scan that came back without spaces can produce thousands of both, and
-    // the table is (tokens x groups) doubles. Per-token phonemization is 1:1 by
-    // construction, so it is the right answer here, not a consolation prize.
-    const many = Array.from({ length: 3000 }, () => "word");
-    expect(alignTokens(many, many.concat(many))).toBeUndefined();
+  it("puts the weld on the function words, not on the noun beside them", () => {
+    // "of a coalition" comes back as `əvə kˌoʊəlˈɪʃən`. By length alone,
+    // "of" + `əvə` and "a coalition" sharing a group is as good an answer.
+    const aligned = alignContextual(["of", "a", "coalition"], ["əvə", "kˌoʊəlˈɪʃən"])!;
+    expect(aligned.map((w) => w.phonemes)).toEqual(["əv", "ə", "kˌoʊəlˈɪʃən"]);
+  });
+
+  it("does not let a word be shifted onto its neighbour's sound", () => {
+    // "(Putnam 1993, 45); pages 12 to 19" — when "45" took one group too few,
+    // every word after it slid one place and still scored well on length.
+    const tokens = ["45);", "pages", "12", "to", "19"];
+    const groups = ["fˈoːɹɾi", "fˈaɪv»;", "pˈeɪdʒᵻz", "twˈɛlv", "tə", "nˈaɪntiːn"];
+    const aligned = alignContextual(tokens, groups)!;
+    expect(aligned.map((w) => w.phonemes)).toEqual(["fˈoːɹɾi fˈaɪv»;", "pˈeɪdʒᵻz", "twˈɛlv", "tə", "nˈaɪntiːn"]);
+    expect(opensLike("pages", "fˈaɪv")).toBe(false);
+    expect(opensLike("phase", "fˈeɪz")).toBe(true);
+  });
+
+  it("never changes a symbol when it divides a group", () => {
+    for (const [group, tokens] of [
+      ["ʌvðə", ["of", "the"]],
+      ["ðætðə", ["that", "the"]],
+      ["nˌɑːɾə", ["not", "a"]],
+      ["ɪnwˌɪtʃ", ["in", "which"]],
+      ["ə", ["a", "the", "of"]],
+    ] as Array<[string, string[]]>) {
+      const parts = divideGroup(group, tokens);
+      expect(parts.length).toBe(tokens.length);
+      expect(parts.join("")).toBe(group);
+    }
+    // A stress mark goes with the syllable after it, a length mark with the
+    // vowel before it.
+    expect(divideGroup("ɪnwˌɪtʃ", ["in", "which"])).toEqual(["ɪn", "wˌɪtʃ"]);
+  });
+
+  it("cuts long blocks into passages at sentence ends", () => {
+    const tokens = Array.from({ length: 300 }, (_, i) => (i % 25 === 24 ? "end." : "word"));
+    const cuts = passages(tokens, 120);
+    expect(cuts[0][0]).toBe(0);
+    expect(cuts[cuts.length - 1][1]).toBe(300);
+    for (const [from, to] of cuts) {
+      expect(to - from).toBeLessThanOrEqual(120);
+      if (to < 300) expect(tokens[to - 1]).toBe("end.");
+    }
   });
 });
 
 describe("§0.3 word grouping survives eSpeak's merges", () => {
-  it("returns one non-empty phoneme string per token where words run together", async () => {
+  it("feeds the voice the contextual stream, not word-by-word readings", async () => {
     const phonemizer = new EspeakPhonemizer();
-    // "that the" and "of the" are the pair eSpeak merges most often, and this
-    // sentence used to fall all the way back to per-token phonemization.
+    // "that the" and "of the" are the pairs eSpeak merges most often, and this
+    // sentence used to go through the per-token path.
     const text = "The record shows that the record of the vote was recorded by a clerk.";
     const tokens = tokensOf(text);
     const words = await phonemizer.phonemize(tokens, []);
 
     expect(words.length).toBe(tokens.length);
-    for (const word of words) {
-      expect(word.phonemes.length, JSON.stringify(word.token)).toBeGreaterThan(0);
-    }
-    // The context-sensitive reading survives for the words around the merge:
-    // the noun "record" is stressed on its first syllable, the verb on its
+    expect(phonemizer.isolatedPassages).toBe(0);
+    // The weak forms survive: "a" is a schwa, not the letter A, and "the" is
+    // unstressed.
+    expect(words[13].phonemes).not.toContain("eɪ");
+    for (const index of [4, 7]) expect(words[index].phonemes).not.toMatch(/[ˈˌ]/u);
+    // The noun "record" is stressed on its first syllable, the verb on its
     // second, and both appear here.
     expect(words[1].phonemes).not.toBe(words[10].phonemes);
+    // No word was spoken twice.
+    const stream = words.map((w) => (w.joined ? "" : " ") + w.phonemes).join("");
+    expect(stream.match(/ðə/gu)?.length).toBe(3);
   }, 60_000);
 });
 
@@ -230,42 +256,64 @@ describe("§6.2 chunking", () => {
     expect(words).toBe(tokensOf(source.spokenText).length);
   }, 120_000);
 
-  it("prefers a sentence end when one is inside the last quarter of the budget", () => {
-    // 200 words, each 5 phonemes plus a separating space, so 1200 tokens: three
-    // chunks at a target of 400 apiece, with a 100-token backoff window. A
-    // sentence ending at word 60 sits 365 tokens in, inside that window.
-    const build = (sentenceAt: number) => {
-      const tokens: string[] = [];
-      const ids: number[] = [];
-      const ranges: Array<{ start: number; end: number }> = [];
-      for (let i = 0; i < 200; i++) {
-        tokens.push(i === sentenceAt ? "settlements." : `word${i}`);
-        if (i > 0) ids.push(16);
-        const start = ids.length;
-        for (let p = 0; p < 5; p++) ids.push(70 + p);
-        ranges.push({ start, end: ids.length });
-      }
-      return { tokens, ids, ranges };
-    };
+  /** `count` words of five phonemes each, a space between, sentence ends where asked. */
+  const build = (count: number, sentenceEvery: number) => {
+    const tokens: string[] = [];
+    const ids: number[] = [];
+    const ranges: Array<{ start: number; end: number }> = [];
+    for (let i = 0; i < count; i++) {
+      tokens.push(sentenceEvery > 0 && i % sentenceEvery === sentenceEvery - 1 ? "settlements." : `word${i}`);
+      if (i > 0) ids.push(16);
+      const start = ids.length;
+      for (let p = 0; p < 5; p++) ids.push(70 + p);
+      ranges.push({ start, end: ids.length });
+    }
+    return { tokens, ids, ranges };
+  };
 
-    const withSentence = build(60);
-    const chunks = splitChunks("b", withSentence.ids, withSentence.ranges, withSentence.tokens);
+  it("cuts only at sentence ends, and packs sentences up to the target", () => {
+    // Sentences of 12 words, 71 tokens each: three fit under the target.
+    const text = build(120, 12);
+    const chunks = splitChunks("b", text.ids, text.ranges, text.tokens);
     expect(chunks.length).toBeGreaterThan(1);
-    expect(chunks[0].wordPhonemeRanges.length).toBe(61);
-
-    // With no sentence end in range the split falls on a word boundary instead,
-    // which is further in — so the backoff really did move it.
-    const without = build(-1);
-    const plain = splitChunks("b", without.ids, without.ranges, without.tokens);
-    expect(plain[0].wordPhonemeRanges.length).toBeGreaterThan(61);
-
-    // Every word still lands in exactly one chunk, in order.
     let seen = 0;
     for (const chunk of chunks) {
       expect(chunk.spanOffset).toBe(seen);
       seen += chunk.wordPhonemeRanges.length;
+      expect(text.tokens[seen - 1]).toBe("settlements.");
+      expect(chunk.tokens.length).toBeLessThanOrEqual(TARGET);
     }
-    expect(seen).toBe(200);
+    expect(seen).toBe(120);
+  });
+
+  it("keeps a paragraph of a sentence or two in one chunk", () => {
+    const text = build(30, 15);
+    expect(splitChunks("b", text.ids, text.ranges, text.tokens).length).toBe(1);
+  });
+
+  it("does not leave a short sentence on its own", () => {
+    // Four sentences of 12 words, then one of 3: the last rides along.
+    const tokens = [...build(48, 12).tokens, "it", "really", "was."];
+    const text = build(51, 0);
+    const chunks = splitChunks("b", text.ids, text.ranges, tokens);
+    for (const chunk of chunks) expect(chunk.tokens.length).toBeGreaterThanOrEqual(MIN_CHUNK);
+  });
+
+  it("divides a sentence too long to render well, evenly and within the budget", () => {
+    const text = build(200, 0);
+    const chunks = splitChunks("b", text.ids, text.ranges, text.tokens);
+    expect(chunks.length).toBeGreaterThan(1);
+    const sizes = chunks.map((c) => c.tokens.length);
+    for (const size of sizes) expect(size).toBeLessThanOrEqual(BUDGET);
+    expect(Math.max(...sizes) - Math.min(...sizes)).toBeLessThan(80);
+  });
+
+  it("never separates two words eSpeak welded together", () => {
+    const text = build(200, 0);
+    // Every other word is welded to the one before it.
+    const joined = text.tokens.map((_, i) => i % 2 === 1);
+    const chunks = splitChunks("b", text.ids, text.ranges, text.tokens, joined);
+    for (const chunk of chunks) expect(chunk.spanOffset % 2).toBe(0);
   });
 
   it("knows an abbreviation from a sentence end", () => {
@@ -284,6 +332,26 @@ describe("§6.2 chunking", () => {
     expect(chunks.length).toBe(1);
     expect(chunks[0].tokens.length).toBe(BUDGET);
     expect(chunks[0].wordPhonemeRanges[0].end).toBeLessThanOrEqual(BUDGET);
+  });
+
+  it("encodes a weld without a space and a silent token without two", async () => {
+    const chunker = new Chunker();
+    const fake = {
+      name: "fake",
+      capabilities: { providesWordGrouping: true, resolvesHomographs: true, expandsNumbers: true },
+      phonemize: async (tokens: readonly string[]) =>
+        tokens.map((token) => ({
+          token,
+          phonemes: token === "—" ? "" : token === "the" ? "ðə" : "ʌv",
+          joined: token === "the",
+        })),
+    };
+    const { chunks } = await chunker.chunk(block("of the — of"), fake);
+    const space = defaultVocabulary.spaceID!;
+    const ids = chunks[0].tokens;
+    // ʌv ðə ␠ ʌv — one space, between the weld and the last word.
+    expect(ids.filter((id) => id === space).length).toBe(1);
+    expect(chunks[0].wordPhonemeRanges[2].start).toBe(chunks[0].wordPhonemeRanges[2].end);
   });
 });
 
