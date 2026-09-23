@@ -76,7 +76,7 @@ const WAVEFORM_OUTPUT_NAMES = ["waveform", "audio", "output", "wav"];
 const DURATION_OUTPUT_NAMES = ["duration", "durations", "pred_dur", "d", "dur"];
 
 export interface KokoroEngineConfig {
-  /** The full model: phoneme ids in, waveform out. */
+  /** The full model: phoneme ids in, waveform out. Half precision; what the CPU runs. */
   modelUrl: string;
   /**
    * Optional duration-only subgraph, cut from the same file by
@@ -85,16 +85,17 @@ export interface KokoroEngineConfig {
    */
   durationModelUrl?: string;
   /**
-   * A model the GPU is known to be able to run, tried *before* the CPU.
+   * The model the GPU runs first: full precision.
    *
-   * The default model is fp16, which is the fastest thing a GPU can run and the
-   * one thing some drivers will not run at all. When that happens the remedy is
-   * a different file, not a different device — so if one is sitting next to the
-   * first (`npm run assets -- --gpu-fallback` puts it there), the ladder loads
-   * it on the GPU rather than moving the whole engine to the CPU. A 404 here is
-   * not an error: it is simply one fewer rung.
+   * kokoro-js, the reference web client for this checkpoint, says it plainly:
+   * on WebGPU, use fp32. At half precision the vocoder's phase arithmetic
+   * loses enough to be heard — a metallic, smeared voice — and some drivers
+   * will not run an fp16 graph at all. The CPU has neither problem, and on the
+   * CPU an fp16 file is the fastest of the lot, so `modelUrl` stays fp16 for
+   * the CPU and for a GPU that will not take this one. `npm run assets` fetches
+   * both. A 404 here is not an error: it is simply one fewer rung.
    */
-  gpuFallbackModelUrl?: string;
+  gpuModelUrl?: string;
   /** Directory holding `<voice>.bin`. */
   voicesBaseUrl: string;
   voiceID: string;
@@ -256,8 +257,14 @@ export class KokoroEngine {
     const { onProgress, beforeCompile, onProviderRejected } = hooks;
     configureRuntime(config.threads);
 
-    const [modelBytes, durationBytes, voice] = await Promise.all([
-      fetchModel(config.modelUrl, "Kokoro model", onProgress),
+    // Only the file the first rung will load is downloaded up front: a machine
+    // whose GPU runs the full-precision model never needs the half-precision
+    // one, and a machine with no GPU never needs the full-precision one — a
+    // few hundred megabytes either way, on every first visit.
+    const files = modelFiles(config, onProgress);
+    const first = planAttempts(config, await probeAdapters(gpuOf())).find((a) => files.exists(a.model));
+    const [, durationBytes, voice] = await Promise.all([
+      first ? files.bytes(first.model) : Promise.resolve(undefined),
       config.durationModelUrl
         ? fetchModel(config.durationModelUrl, "Duration model", onProgress).catch(() => undefined)
         : Promise.resolve(undefined),
@@ -266,8 +273,8 @@ export class KokoroEngine {
 
     await beforeCompile?.();
 
-    // Probed here rather than at the top of the load: an adapter handed over
-    // minutes earlier — across a few hundred megabytes of download — may have
+    // Probed again rather than trusted from before the download: an adapter
+    // handed over minutes earlier — across a few hundred megabytes — may have
     // gone stale, and on a laptop the answer can change while the download
     // runs.
     const plan = planAttempts(config, await probeAdapters(gpuOf()));
@@ -276,7 +283,7 @@ export class KokoroEngine {
     // load with nothing to report, so it gets its own label.
     onProgress?.(COMPILE_LABEL, 0, 1);
 
-    const context = attemptContext(config, vocabulary, voice, modelBytes);
+    const context = attemptContext(config, vocabulary, voice, files);
     const walked = await walkPlan(plan, 0, context, onProviderRejected);
     const main = walked.live;
 
@@ -511,7 +518,7 @@ export class KokoroEngine {
     const rebuild = (async () => {
       const previous = { model: this.model, duration: this.durationModel, gpu: this.gpuDevice };
       try {
-        const context = attemptContext(this.config, this.vocabulary, this.voice);
+        const context = attemptContext(this.config, this.vocabulary, this.voice, modelFiles(this.config));
         const walked = await walkPlan(this.plan, this.planIndex + 1, context);
         const main = walked.live;
 
@@ -679,8 +686,8 @@ export interface Attempt {
    * still several times a CPU.
    */
   optimization: "all" | "disabled";
-  /** Which model file this rung loads. */
-  model: "primary" | "gpuFallback";
+  /** Which model file this rung loads: `gpu` is full precision, `primary` half. */
+  model: "primary" | "gpu";
 }
 
 /** `navigator.gpu`, where there is one. Workers have it; Node does not. */
@@ -697,41 +704,40 @@ function describeCandidate(candidate: GpuCandidate): string {
 /**
  * The ladder, in the order it is climbed down.
  *
- * Every GPU first, best first; then the best GPU with fusions off; then a model
- * file a GPU is known to accept; and the CPU last, and only if it is allowed at
- * all. `device: "webgpu"` removes the CPU rung entirely, which is the
- * difference between "prefer the GPU" and "the GPU or tell me why not".
+ * Every GPU first, best first, each with the full-precision model before the
+ * half-precision one; then the best GPU with fusions off; and the CPU last,
+ * and only if it is allowed at all. `device: "webgpu"` removes the CPU rung
+ * entirely, which is the difference between "prefer the GPU" and "the GPU or
+ * tell me why not".
  */
 export function planAttempts(config: KokoroEngineConfig, candidates: readonly GpuCandidate[]): Attempt[] {
   const wanted = config.device ?? "auto";
   const attempts: Attempt[] = [];
+  const models: Array<Attempt["model"]> = config.gpuModelUrl ? ["gpu", "primary"] : ["primary"];
+  const describeModel = (model: Attempt["model"]) =>
+    config.gpuModelUrl ? (model === "gpu" ? ", full precision" : ", half precision") : "";
 
   if (wanted !== "wasm") {
     for (const candidate of candidates) {
-      attempts.push({
-        provider: "webgpu",
-        candidate,
-        optimization: "all",
-        model: "primary",
-        label: `GPU — ${describeCandidate(candidate)}`,
-      });
+      for (const model of models) {
+        attempts.push({
+          provider: "webgpu",
+          candidate,
+          optimization: "all",
+          model,
+          label: `GPU — ${describeCandidate(candidate)}${describeModel(model)}`,
+        });
+      }
     }
     const best = candidates[0];
     if (best) {
-      attempts.push({
-        provider: "webgpu",
-        candidate: best,
-        optimization: "disabled",
-        model: "primary",
-        label: `GPU — ${describeCandidate(best)}, graph fusions off`,
-      });
-      if (config.gpuFallbackModelUrl) {
+      for (const model of models) {
         attempts.push({
           provider: "webgpu",
           candidate: best,
-          optimization: "all",
-          model: "gpuFallback",
-          label: `GPU — ${describeCandidate(best)}, GPU-compatible model`,
+          optimization: "disabled",
+          model,
+          label: `GPU — ${describeCandidate(best)}${describeModel(model)}, graph fusions off`,
         });
       }
     }
@@ -763,10 +769,9 @@ export function explainRejection(
   if (!adapter) return `webgpu: ${reason}`;
   if (!adapter.shaderF16) {
     return (
-      `${adapter.description} cannot do 16-bit shader arithmetic, so it cannot run an fp16 model — ` +
-      "which is the default one. Keep it on the GPU with " +
-      '"npm run assets -- --gpu-fallback", which fetches an fp32 copy (310 MB) ' +
-      "and leaves it where the engine will find it. " +
+      `${adapter.description} cannot do 16-bit shader arithmetic, so it cannot run an fp16 model. ` +
+      "The full-precision one, kokoro-gpu.onnx, keeps it on the GPU: " +
+      '"npm run assets" fetches it (310 MB) and leaves it where the engine will find it. ' +
       `The underlying error was: ${reason}`
     );
   }
@@ -791,9 +796,9 @@ interface LiveSession {
 }
 
 /**
- * Everything a rung needs that is not the rung itself: the model bytes (fetched
- * once, however many rungs use them), the voice, and the vocabulary the smoke
- * test encodes with.
+ * Everything a rung needs that is not the rung itself: the model files (each
+ * fetched at most once, however many rungs use it), the voice, and the
+ * vocabulary the smoke test encodes with.
  */
 interface AttemptContext {
   config: KokoroEngineConfig;
@@ -802,32 +807,43 @@ interface AttemptContext {
   bytes(which: Attempt["model"]): Promise<Uint8Array | undefined>;
 }
 
-function attemptContext(
-  config: KokoroEngineConfig,
-  vocabulary: KokoroVocabulary,
-  voice: Voice,
-  primary?: Uint8Array,
-): AttemptContext {
-  const cache = new Map<Attempt["model"], Promise<Uint8Array | undefined>>();
-  if (primary) cache.set("primary", Promise.resolve(primary));
+interface ModelFiles {
+  /** Whether a rung for this file is worth considering at all. */
+  exists(which: Attempt["model"]): boolean;
+  bytes(which: Attempt["model"]): Promise<Uint8Array | undefined>;
+}
 
+function modelFiles(config: KokoroEngineConfig, onProgress?: LoadProgress): ModelFiles {
+  const cache = new Map<Attempt["model"], Promise<Uint8Array | undefined>>();
+  const urlOf = (which: Attempt["model"]) => (which === "primary" ? config.modelUrl : config.gpuModelUrl);
+  const missing = new Set<Attempt["model"]>();
   return {
-    config,
-    vocabulary,
-    voice,
+    exists: (which) => urlOf(which) !== undefined && !missing.has(which),
     bytes(which) {
       const existing = cache.get(which);
       if (existing) return existing;
-      const url = which === "primary" ? config.modelUrl : config.gpuFallbackModelUrl;
-      // A missing GPU-compatible model is a rung that is not there, not a
-      // failure: most installs will not have fetched one.
+      const url = urlOf(which);
+      // A missing full-precision model is a rung that is not there, not a
+      // failure: an install may have skipped it.
       const fetched = url
-        ? fetchModel(url, which === "primary" ? "Kokoro model" : "GPU model").catch(() => undefined)
+        ? fetchModel(url, "Kokoro model", onProgress).catch(() => {
+            missing.add(which);
+            return undefined;
+          })
         : Promise.resolve(undefined);
       cache.set(which, fetched);
       return fetched;
     },
   };
+}
+
+function attemptContext(
+  config: KokoroEngineConfig,
+  vocabulary: KokoroVocabulary,
+  voice: Voice,
+  files: ModelFiles,
+): AttemptContext {
+  return { config, vocabulary, voice, bytes: (which) => files.bytes(which) };
 }
 
 /**
@@ -855,10 +871,10 @@ async function walkPlan(
    * Why the GPU was given up on, held until the CPU rung is actually reached.
    *
    * Reporting it from "the last GPU rung" instead would miss the ordinary case:
-   * the last GPU rung is usually the GPU-compatible model file, most installs
-   * have not fetched one, and a rung that is skipped rather than tried throws
-   * nothing to report — so the app would land on the CPU in silence, which is
-   * the one outcome this whole file exists to make impossible to miss.
+   * the last GPU rungs may be for a model file this install skipped, and a
+   * rung that is skipped rather than tried throws nothing to report — so the
+   * app would land on the CPU in silence, which is the one outcome this whole
+   * file exists to make impossible to miss.
    */
   let gpuGaveUp: string | undefined;
 

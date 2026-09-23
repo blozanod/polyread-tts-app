@@ -1,6 +1,6 @@
 import { buildReflowDocument, type ReflowDocument } from "../core/reflow";
 import { isSpoken, type Block, type PhonemizedChunk } from "../core/types";
-import { BUDGET, Chunker } from "./chunker";
+import { BUDGET, Chunker, OPENING_TARGET, TARGET, type ChunkResult } from "./chunker";
 import { EspeakPhonemizer } from "./espeakPhonemizer";
 import { normalize } from "./normalizer";
 import type { Phonemizer } from "./phonemizer";
@@ -22,13 +22,27 @@ export interface LinguisticsOutput {
 }
 
 /** Runs the whole of Agent B over a document: §5 then §6. */
+export interface LinguisticsOptions {
+  /**
+   * Blocks phonemized at once. One is right for a phonemizer on this thread;
+   * a pool of workers wants enough in flight to keep every one of them busy.
+   */
+  concurrency?: number;
+}
+
 export class LinguisticsPipeline {
   private readonly chunker: Chunker;
   readonly phonemizer: Phonemizer;
+  private readonly concurrency: number;
 
-  constructor(phonemizer: Phonemizer = new EspeakPhonemizer(), vocabulary: KokoroVocabulary = defaultVocabulary) {
+  constructor(
+    phonemizer: Phonemizer = new EspeakPhonemizer(),
+    vocabulary: KokoroVocabulary = defaultVocabulary,
+    options: LinguisticsOptions = {},
+  ) {
     this.phonemizer = phonemizer;
     this.chunker = new Chunker(vocabulary);
+    this.concurrency = Math.max(1, Math.floor(options.concurrency ?? 1));
   }
 
   async run(
@@ -45,17 +59,36 @@ export class LinguisticsPipeline {
     const unknown: Record<string, number> = {};
 
     const spokenBlocks = blocks.filter((b) => isSpoken(b.role));
+    // The first two blocks of the main stream — usually a title and the
+    // paragraph under it — are what the listener waits on.
+    const opening = new Set(spokenBlocks.filter((b) => b.role !== "footnoteBody").slice(0, 2).map((b) => b.id));
+    // In flight several at a time, assembled in document order afterwards.
+    const results = new Array<ChunkResult>(spokenBlocks.length);
+    let next = 0;
     let done = 0;
-    for (const block of spokenBlocks) {
-      const result = await this.chunker.chunk(block, this.phonemizer);
+    const lane = async (): Promise<void> => {
+      while (next < spokenBlocks.length) {
+        const index = next++;
+        const block = spokenBlocks[index];
+        results[index] = await this.chunker.chunk(
+          block,
+          this.phonemizer,
+          opening.has(block.id) ? OPENING_TARGET : TARGET,
+        );
+        done += 1;
+        onProgress?.(done, spokenBlocks.length);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(this.concurrency, spokenBlocks.length) }, lane));
+
+    spokenBlocks.forEach((block, index) => {
+      const result = results[index];
       for (const [symbol, count] of Object.entries(result.unknownSymbols)) {
         unknown[symbol] = (unknown[symbol] ?? 0) + count;
       }
       if (block.role === "footnoteBody") footnoteChunks[block.id] = result.chunks;
       else mainChunks.push(...result.chunks);
-      done += 1;
-      onProgress?.(done, spokenBlocks.length);
-    }
+    });
 
     let overBudgetChunks = 0;
     for (const chunk of [...mainChunks, ...Object.values(footnoteChunks).flat()]) {

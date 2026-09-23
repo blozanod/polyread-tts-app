@@ -184,40 +184,53 @@ describe("running on the GPU, always", () => {
     expect(engine.attempts.join(" ")).toContain("graph fusions off");
   });
 
-  it("loads the GPU-compatible model rather than dropping to the CPU", async () => {
+  it("runs the full-precision model on the GPU, and downloads nothing else", async () => {
     stubNavigator([{ description: "Iris Xe", vendor: "intel", features: [] }]);
     stubFetch(() => true);
     runtime.webgpuFailsWith = CLIP;
-
-    // The GPU refuses the fp16 model in every configuration, and accepts the
-    // fp32 spare. That is the real shape of the reported failure, and the rung
-    // that answers it is the last one before the CPU.
+    // The GPU refuses the fp16 model in every configuration and accepts fp32 —
+    // which is now the one it is offered first.
     runtime.webgpuWorksWhenBytes = GPU_MODEL_BYTES;
+    const fetched: string[] = [];
+    const inner = globalThis.fetch;
+    vi.stubGlobal("fetch", (url: string) => {
+      fetched.push(url);
+      return inner(url);
+    });
 
     const { KokoroEngine } = await import("../src/synthesis/kokoroEngine");
     const { defaultVocabulary } = await import("../src/linguistics/vocabulary");
     const rejected: string[] = [];
     const engine = await KokoroEngine.load(
-      { ...config, gpuFallbackModelUrl: "models/kokoro-gpu.onnx" },
+      { ...config, gpuModelUrl: "models/kokoro-gpu.onnx" },
       defaultVocabulary,
       { onProviderRejected: (_p, reason) => rejected.push(reason) },
     );
 
     expect(engine.device).toBe("webgpu");
-    // Three WebGPU rungs: the fp16 model fused, the same unfused, then the
-    // fp32 spare — and no CPU rung reached, so nothing to report.
-    expect(runtime.created.map((c) => c.bytes)).toEqual([
-      PRIMARY_MODEL_BYTES,
-      PRIMARY_MODEL_BYTES,
-      GPU_MODEL_BYTES,
-    ]);
-    expect(engine.attempts.at(-1)).toContain("GPU-compatible model");
+    expect(runtime.created.map((c) => c.bytes)).toEqual([GPU_MODEL_BYTES]);
+    expect(engine.attempts.at(-1)).toContain("full precision");
+    // The half-precision file was never needed, so it was never fetched.
+    expect(fetched.some((url) => url.endsWith("kokoro.onnx"))).toBe(false);
     expect(rejected).toEqual([]);
+  });
+
+  it("falls back to the half-precision model on the GPU before the CPU", async () => {
+    stubNavigator([{ description: "Iris Xe", vendor: "intel", features: ["shader-f16"] }]);
+    stubFetch(() => true);
+    runtime.webgpuFailsWith = CLIP;
+    runtime.webgpuWorksWhenBytes = PRIMARY_MODEL_BYTES;
+
+    const { KokoroEngine } = await import("../src/synthesis/kokoroEngine");
+    const { defaultVocabulary } = await import("../src/linguistics/vocabulary");
+    const engine = await KokoroEngine.load({ ...config, gpuModelUrl: "models/kokoro-gpu.onnx" }, defaultVocabulary);
+    expect(engine.device).toBe("webgpu");
+    expect(runtime.created.map((c) => c.bytes)).toEqual([GPU_MODEL_BYTES, PRIMARY_MODEL_BYTES]);
   });
 
   it("says so, loudly, when it does end up on the CPU", async () => {
     stubNavigator([{ description: "Iris Xe", vendor: "intel", features: [] }]);
-    // No GPU-compatible spare has been fetched: the rung is skipped rather than
+    // No full-precision model has been fetched: the rung is skipped rather than
     // failed, which is exactly the path that used to reach the CPU in silence.
     stubFetch((url) => !url.includes("kokoro-gpu"));
     runtime.webgpuFailsWith = CLIP;
@@ -226,7 +239,7 @@ describe("running on the GPU, always", () => {
     const { defaultVocabulary } = await import("../src/linguistics/vocabulary");
     const rejected: string[] = [];
     const engine = await KokoroEngine.load(
-      { ...config, gpuFallbackModelUrl: "models/kokoro-gpu.onnx" },
+      { ...config, gpuModelUrl: "models/kokoro-gpu.onnx" },
       defaultVocabulary,
       { onProviderRejected: (_p, reason) => rejected.push(reason) },
     );
@@ -236,7 +249,7 @@ describe("running on the GPU, always", () => {
     // The GPU has no 16-bit shaders, so the message has to name the remedy —
     // a model file, not a GPU — rather than quoting a shader called Clip.
     expect(rejected[0]).toContain("Iris Xe");
-    expect(rejected[0]).toContain("--gpu-fallback");
+    expect(rejected[0]).toContain("kokoro-gpu.onnx");
   });
 
   it("refuses to run at all when Settings says GPU only", async () => {

@@ -17,6 +17,7 @@ import type { PdfDocumentProxy, PdfLoadingTask } from "../extraction/pdfTypes";
 import type { BackendDecision } from "../extraction/quality";
 import { EspeakPhonemizer } from "../linguistics/espeakPhonemizer";
 import { LinguisticsPipeline } from "../linguistics/pipeline";
+import { PhonemizerPool, poolSize } from "../linguistics/phonemizerPool";
 import { assertVocabularyShape, loadVocabulary, type KokoroVocabulary } from "../linguistics/vocabulary";
 import { unencodableEntries } from "../linguistics/homographs";
 import { SynthesisCoordinator, type CoordinatorEvent } from "../synthesis/coordinator";
@@ -140,7 +141,7 @@ function ensureEngine(): Promise<KokoroEngine> {
       {
         modelUrl: configured.modelUrl,
         durationModelUrl: configured.durationModelUrl,
-        gpuFallbackModelUrl: configured.gpuFallbackModelUrl,
+        gpuModelUrl: configured.gpuModelUrl,
         voicesBaseUrl: configured.voicesBaseUrl,
         voiceID: configured.voiceID,
         device: configured.device,
@@ -289,10 +290,18 @@ async function importDocument(
   // the pipeline without it encoded every document with the built-in table,
   // whatever `tokenizer.json` said.
   const vocabulary = await vocabularyForSettings();
-  const linguistics = new LinguisticsPipeline(new EspeakPhonemizer(language), vocabulary);
-  const analysed = await linguistics.run(extraction.blocks, (done, total) =>
-    post({ type: "stage", stage: "Reading it out to itself", done, total }),
-  );
+  const pool = phonemizerPool(language);
+  let analysed: Awaited<ReturnType<LinguisticsPipeline["run"]>>;
+  try {
+    const linguistics = new LinguisticsPipeline(pool ?? new EspeakPhonemizer(language), vocabulary, {
+      concurrency: pool ? pool.size * 2 : 1,
+    });
+    analysed = await linguistics.run(extraction.blocks, (done, total) =>
+      post({ type: "stage", stage: "Reading it out to itself", done, total }),
+    );
+  } finally {
+    pool?.dispose();
+  }
 
   coordinator?.cancel();
   coordinator = newCoordinator(hash, vocabulary);
@@ -561,6 +570,27 @@ async function replaySidecar(
   await startSynthesis(coordinator, engineReady);
 }
 
+/**
+ * eSpeak on a few workers of its own, for the one stage of an import that is
+ * all arithmetic and no waiting (see `phonemizerPool.ts`). Undefined where
+ * this worker cannot start workers of its own, which leaves the import on the
+ * single-threaded path it has always had.
+ */
+function phonemizerPool(language: "a" | "b"): PhonemizerPool | undefined {
+  if (typeof Worker === "undefined") return undefined;
+  const size = poolSize(navigator.hardwareConcurrency ?? 2);
+  if (size < 2) return undefined;
+  try {
+    return new PhonemizerPool(
+      language,
+      size,
+      () => new Worker(new URL("./phonemizer.worker.ts", import.meta.url), { type: "module" }),
+    );
+  } catch {
+    return undefined;
+  }
+}
+
 /** The vocabulary Phase A's estimates index into; cached across documents. */
 let vocabularyPromise: Promise<KokoroVocabulary> | undefined;
 function vocabularyForSettings(): Promise<KokoroVocabulary> {
@@ -723,7 +753,24 @@ async function benchmark(): Promise<string> {
   return lines.join("\n");
 }
 
-self.onmessage = async (event: MessageEvent<WorkerRequest>): Promise<void> => {
+/**
+ * True when this copy of the file is one of ONNX Runtime's CPU threads rather
+ * than the pipeline.
+ *
+ * ONNX Runtime starts its thread pool with
+ * `new Worker(new URL(import.meta.url), { name: "em-pthread" })`, and once Vite
+ * has bundled it into this worker, `import.meta.url` is this file. So every
+ * thread is another copy of the pipeline worker: ONNX Runtime's own code runs
+ * as the module loads and installs the handler a thread lives on — and then the
+ * last statement of this file replaced it with the pipeline's. The threads
+ * never started, the model load waited on them forever, and a minute later the
+ * stall watchdog restarted everything on one thread. That is what "nested
+ * workers hang on some browser builds" was: not a browser, this line. In a
+ * thread, the pipeline stays out of the way.
+ */
+const isRuntimeThread = (self as { name?: string }).name?.startsWith("em-pthread") ?? false;
+
+if (!isRuntimeThread) self.onmessage = async (event: MessageEvent<WorkerRequest>): Promise<void> => {
   const message = event.data;
   try {
     switch (message.type) {
@@ -731,6 +778,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>): Promise<void> => {
         const changed =
           settings?.modelUrl !== message.settings.modelUrl ||
           settings?.durationModelUrl !== message.settings.durationModelUrl ||
+          settings?.gpuModelUrl !== message.settings.gpuModelUrl ||
           settings?.voiceID !== message.settings.voiceID ||
           settings?.device !== message.settings.device ||
           settings?.threads !== message.settings.threads;

@@ -24,7 +24,7 @@ export interface AppSettings extends EngineSettings {
 export const DEFAULT_SETTINGS: AppSettings = {
   modelUrl: "models/kokoro.onnx",
   durationModelUrl: "models/kokoro-duration.onnx",
-  gpuFallbackModelUrl: "models/kokoro-gpu.onnx",
+  gpuModelUrl: "models/kokoro-gpu.onnx",
   voicesBaseUrl: "models/voices",
   vocabUrl: "models/tokenizer.json",
   voiceID: DEFAULT_VOICE,
@@ -42,7 +42,12 @@ export function loadSettings(): AppSettings {
   try {
     const stored = localStorage.getItem(KEY);
     if (!stored) return { ...DEFAULT_SETTINGS };
-    return { ...DEFAULT_SETTINGS, ...(JSON.parse(stored) as Partial<AppSettings>) };
+    const parsed = JSON.parse(stored) as Partial<AppSettings> & { gpuFallbackModelUrl?: string };
+    // Renamed when the full-precision model stopped being a fallback and
+    // became the GPU's first choice; a path someone set by hand carries over.
+    const { gpuFallbackModelUrl, ...rest } = parsed;
+    if (gpuFallbackModelUrl !== undefined && rest.gpuModelUrl === undefined) rest.gpuModelUrl = gpuFallbackModelUrl;
+    return { ...DEFAULT_SETTINGS, ...rest };
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -82,9 +87,7 @@ export function engineSettingsOf(settings: AppSettings): EngineSettings {
   return {
     modelUrl: resolveAgainstPage(settings.modelUrl),
     durationModelUrl: settings.durationModelUrl ? resolveAgainstPage(settings.durationModelUrl) : undefined,
-    gpuFallbackModelUrl: settings.gpuFallbackModelUrl
-      ? resolveAgainstPage(settings.gpuFallbackModelUrl)
-      : undefined,
+    gpuModelUrl: settings.gpuModelUrl ? resolveAgainstPage(settings.gpuModelUrl) : undefined,
     voicesBaseUrl: resolveAgainstPage(settings.voicesBaseUrl),
     vocabUrl: settings.vocabUrl ? resolveAgainstPage(settings.vocabUrl) : undefined,
     voiceID: settings.voiceID,

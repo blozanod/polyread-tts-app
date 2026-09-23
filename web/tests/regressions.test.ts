@@ -100,6 +100,25 @@ describe("main-thread bundle", () => {
 });
 
 /**
+ * ONNX Runtime's CPU threads are started from the pipeline worker's own script
+ * once Vite has bundled the runtime into it, so every thread runs this file.
+ * The runtime installs the handler a thread lives on while the module loads;
+ * a pipeline handler assigned unconditionally afterwards replaced it, every
+ * thread waited forever, and the model load hung until the stall watchdog
+ * restarted everything a minute later on a single thread. Only a production
+ * build in a cross-origin-isolated page shows it, which no other test runs.
+ */
+describe("ONNX Runtime threads", () => {
+  it("leaves a runtime thread's message handler alone", () => {
+    const source = readFileSync(join(here, "..", "src", "workers", "pipeline.worker.ts"), "utf8");
+    const assignments = source.split("\n").filter((line) => /\bself\.onmessage\s*=/.test(line));
+    expect(assignments.length).toBe(1);
+    expect(assignments[0]).toMatch(/^if \(!isRuntimeThread\) self\.onmessage/);
+    expect(source).toMatch(/isRuntimeThread = .*name\?\.startsWith\("em-pthread"\)/);
+  });
+});
+
+/**
  * Pressing play on a fresh document starves on chunk 0 at the same moment Phase
  * B is rendering chunk 0. Both paths used to call the engine, so the one chunk
  * the listener was actually waiting for was rendered twice.

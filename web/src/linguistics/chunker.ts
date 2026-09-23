@@ -35,6 +35,14 @@ export const MIN_CHUNK = 60;
 /** A single sentence longer than this is divided at its clauses. */
 export const LONG_SENTENCE = 340;
 
+/**
+ * `TARGET` for the opening of a document. Nothing can be heard until the first
+ * chunk has rendered, and on a CPU a full-sized one is most of ten seconds;
+ * the first paragraph is cut finer so the voice starts sooner, and Phase B is
+ * past it before anyone notices the difference.
+ */
+export const OPENING_TARGET = 110;
+
 export interface ChunkResult {
   chunks: PhonemizedChunk[];
   /**
@@ -87,8 +95,8 @@ export class Chunker {
     this.vocabulary = vocabulary;
   }
 
-  /** Phonemizes and chunks one block. */
-  async chunk(block: Block, phonemizer: Phonemizer): Promise<ChunkResult> {
+  /** Phonemizes and chunks one block. `target` is where a chunk stops taking sentences. */
+  async chunk(block: Block, phonemizer: Phonemizer, target: number = TARGET): Promise<ChunkResult> {
     if (!isSpoken(block.role)) return { chunks: [], unknownSymbols: {} };
 
     const tokens = tokensOf(block.spokenText);
@@ -133,7 +141,7 @@ export class Chunker {
       joined.push(word.joined === true);
     }
 
-    const chunks = splitChunks(block.id, tokenIDs, ranges, tokens, joined);
+    const chunks = splitChunks(block.id, tokenIDs, ranges, tokens, joined, target);
     return { chunks, unknownSymbols: unknown };
   }
 }
@@ -161,8 +169,10 @@ export function splitChunks(
   ranges: readonly TokenRange[],
   tokens: readonly string[],
   joined: readonly boolean[] = [],
+  target: number = TARGET,
 ): PhonemizedChunk[] {
   if (ranges.length === 0) return [];
+  const minimum = Math.min(MIN_CHUNK, target / 2);
   const count = ranges.length;
   /** A chunk may begin at word `w`. */
   const canStart = (w: number): boolean => w <= 0 || w >= count || !joined[w];
@@ -186,24 +196,24 @@ export function splitChunks(
       pieces.push([a, b]);
       continue;
     }
-    for (const [c, d] of pack(a, b, (w) => CLAUSE_END.test(tokens[w] ?? ""), TARGET)) {
+    for (const [c, d] of pack(a, b, (w) => CLAUSE_END.test(tokens[w] ?? ""), target)) {
       if (length(c, d) <= LONG_SENTENCE) {
         pieces.push([c, d]);
         continue;
       }
       // No clause to cut at: as even as the words allow.
-      const parts = Math.ceil(length(c, d) / TARGET);
+      const parts = Math.ceil(length(c, d) / target);
       pieces.push(...pack(c, d, () => true, Math.ceil(length(c, d) / parts)));
     }
   }
 
-  // Whole pieces, packed up to TARGET.
+  // Whole pieces, packed up to the target.
   const spans: Array<[number, number]> = [];
   for (const piece of pieces) {
     const current = spans[spans.length - 1];
     if (current) {
       const combined = length(current[0], piece[1]);
-      if (combined <= TARGET || (length(current[0], current[1]) < MIN_CHUNK && combined <= BUDGET)) {
+      if (combined <= target || (length(current[0], current[1]) < minimum && combined <= BUDGET)) {
         current[1] = piece[1];
         continue;
       }
@@ -214,7 +224,7 @@ export function splitChunks(
   if (spans.length >= 2) {
     const last = spans[spans.length - 1];
     const previous = spans[spans.length - 2];
-    if (length(last[0], last[1]) < MIN_CHUNK && length(previous[0], last[1]) <= BUDGET) {
+    if (length(last[0], last[1]) < minimum && length(previous[0], last[1]) <= BUDGET) {
       previous[1] = last[1];
       spans.pop();
     }

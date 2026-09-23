@@ -13,6 +13,8 @@ import { unencodableEntries, homographPhonemes } from "../src/linguistics/homogr
 import { normalizeText, postProcessPhonemes, splitOnPunctuation } from "../src/linguistics/kokoroText";
 import { affixes, normalize } from "../src/linguistics/normalizer";
 import { tagTokens } from "../src/linguistics/posTagger";
+import { LinguisticsPipeline } from "../src/linguistics/pipeline";
+import { PhonemizerPool, poolSize, type PoolWorker } from "../src/linguistics/phonemizerPool";
 import { assertVocabularyShape, defaultVocabulary, framed } from "../src/linguistics/vocabulary";
 
 function block(text: string): Block {
@@ -390,5 +392,60 @@ describe("POS tagging for the override layer", () => {
     expect(homographPhonemes("conflict", "other")).toBe(homographPhonemes("conflict", "noun"));
     // "lead" is settled unconditionally; POS cannot help with it.
     expect(homographPhonemes("lead", "verb")).toBe("lˈid");
+  });
+});
+
+describe("eSpeak on a pool of workers", () => {
+  /** A worker that runs the phonemizer in-process, or misbehaves on request. */
+  function fakeWorker(behaviour: "ok" | "errors" | "dies" = "ok"): PoolWorker {
+    const local = new EspeakPhonemizer();
+    const worker: PoolWorker = {
+      onmessage: null,
+      onerror: null,
+      postMessage(message) {
+        setTimeout(async () => {
+          if (behaviour === "dies") {
+            worker.onerror?.({} as ErrorEvent);
+            return;
+          }
+          if (behaviour === "errors") {
+            worker.onmessage?.({ data: { id: message.id, error: "boom" } } as MessageEvent);
+            return;
+          }
+          const words = await local.phonemize(message.tokens, []);
+          worker.onmessage?.({ data: { id: message.id, words, isolatedPassages: 0 } } as MessageEvent);
+        }, Math.random() * 5);
+      },
+      terminate() {},
+    };
+    return worker;
+  }
+
+  it("gives the same chunks as one thread, in document order", async () => {
+    const blocks = Array.from({ length: 12 }, (_, i) =>
+      block(`Paragraph ${i} of the record shows that the vote of the assembly was recorded.`),
+    );
+    const single = await new LinguisticsPipeline().run(blocks);
+    const pool = new PhonemizerPool("a", 3, () => fakeWorker());
+    const pooled = await new LinguisticsPipeline(pool, undefined, { concurrency: 6 }).run(blocks);
+    pool.dispose();
+    expect(pooled.mainChunks.map((c) => c.tokens)).toEqual(single.mainChunks.map((c) => c.tokens));
+    expect(pooled.mainChunks.map((c) => c.blockID)).toEqual(single.mainChunks.map((c) => c.blockID));
+  }, 60_000);
+
+  it("redoes on this thread whatever a worker could not do", async () => {
+    const tokens = tokensOf("the record of the vote");
+    const expected = await new EspeakPhonemizer().phonemize(tokens, []);
+    for (const behaviour of ["errors", "dies"] as const) {
+      const pool = new PhonemizerPool("a", 2, () => fakeWorker(behaviour));
+      expect(await pool.phonemize(tokens, [])).toEqual(expected);
+      pool.dispose();
+    }
+  }, 60_000);
+
+  it("sizes itself to leave a core free", () => {
+    expect(poolSize(1)).toBe(1);
+    expect(poolSize(4)).toBe(3);
+    expect(poolSize(16)).toBe(4);
   });
 });

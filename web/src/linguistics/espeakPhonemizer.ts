@@ -139,26 +139,47 @@ export class EspeakPhonemizer implements Phonemizer {
     return homographPhonemes(bare, tag ?? "other");
   }
 
-  /** kokoro-js's `phonemize`, step for step. */
+  /**
+   * kokoro-js's `phonemize`, step for step — except that it makes one call
+   * into eSpeak where kokoro-js makes one per stretch of text between two
+   * punctuation marks.
+   *
+   * Each call re-selects the voice and runs a synthesis pass of its own, about
+   * five milliseconds before a single word is read, and a paragraph of
+   * academic prose has a comma every eight words. That overhead was most of
+   * the time an import spent "reading it out to itself". eSpeak treats a blank
+   * line as the end of a clause, exactly as it treats the punctuation the
+   * stretches were cut at, so the stretches are sent together, one per
+   * paragraph of eSpeak's input, and come back one per line. Where they do not
+   * — a stretch long enough that eSpeak broke it itself — the passage is
+   * phonemized a stretch at a time, as before.
+   */
   private async phonemizeContextually(text: string): Promise<string> {
     const espeak = await loadEspeak();
     const voice = ESPEAK_VOICE[this.language];
     const normalized = normalizeText(text);
     const segments = splitOnPunctuation(normalized);
-    const parts = await Promise.all(
-      segments.map(async (segment) => {
-        if (segment.isPunctuation) return segment.text;
-        const trimmed = segment.text.trim();
-        if (!trimmed) return segment.text;
-        const spoken = (await espeak(segment.text, voice)).join(" ");
-        // Keep the segment's own outer spacing: it is what separates this run
-        // of words from the punctuation on either side, and dropping it would
-        // weld two tokens into one group.
-        const lead = /^\s/.test(segment.text) ? " " : "";
-        const tail = /\s$/.test(segment.text) ? " " : "";
-        return lead + spoken + tail;
-      }),
-    );
+    const spoken = segments.filter((s) => !s.isPunctuation && s.text.trim().length > 0);
+
+    let readings: string[] | undefined;
+    if (spoken.length > 1) {
+      const lines = await espeak(spoken.map((s) => s.text.trim()).join("\n\n"), voice);
+      if (lines.length === spoken.length) readings = lines;
+    }
+    readings ??= await Promise.all(spoken.map(async (s) => (await espeak(s.text, voice)).join(" ")));
+
+    let next = 0;
+    const parts = segments.map((segment) => {
+      if (segment.isPunctuation) return segment.text;
+      if (!segment.text.trim()) return segment.text;
+      const reading = readings[next++] ?? "";
+      // Keep the segment's own outer spacing: it is what separates this run
+      // of words from the punctuation on either side, and dropping it would
+      // weld two tokens into one group.
+      const lead = /^\s/.test(segment.text) ? " " : "";
+      const tail = /\s$/.test(segment.text) ? " " : "";
+      return lead + reading + tail;
+    });
     return postProcessPhonemes(parts.join(""), this.language);
   }
 
