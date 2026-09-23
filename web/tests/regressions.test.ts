@@ -355,8 +355,8 @@ describe("§7.3 render scheduling", () => {
  * reached the reader was every paragraph with its own words shuffled.
  *
  * It only ever showed on a scan. A born-digital page emits a whole line as one
- * text item, so `splitItemIntoRuns` copies one exact `transform[5]` onto every
- * word of the line, the baselines tie, the sort is stable, and the order
+ * text item, so every word cut out of it carries the item's one `transform[5]`,
+ * the baselines tie, the sort is stable, and the order
  * survives — which is why the cover page of the same PDF read perfectly and
  * every test here used exactly-equal baselines and passed.
  */

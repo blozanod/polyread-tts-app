@@ -530,7 +530,7 @@ export function alignContextual(tokens: readonly string[], groups: readonly stri
 }
 
 /** Marks that modify the symbol before them and must stay with it. */
-const MODIFIERS = new Set(["ː", "ˑ", "ʰ", "ʲ", "̃", "̩"]);
+const MODIFIERS = new Set(["ː", "ˑ", "ʰ", "ʲ", "\u0303", "\u0329"]);
 const STRESS = new Set(["ˈ", "ˌ"]);
 
 /**

@@ -7,8 +7,8 @@
  * Kokoro v0.19's symbol string (`_pad + _punctuation + _letters +
  * _letters_ipa`) and took each symbol's position as its id. The Swift build did
  * it first and dropped an apostrophe; the web build put the apostrophe back and
- * still got the tail of the list wrong. The v0.19 string ends `↘'̩'ᵻ` — an
- * apostrophe, a combining vertical line, and a *second* apostrophe that
+ * still got the tail of the list wrong. The v0.19 string ends `↘`, `'`, U+0329, `'`, `ᵻ` —
+ * an apostrophe, a combining vertical line, and a *second* apostrophe that
  * overwrites the first in the dict comprehension — so `ᵻ` is 177, not 175.
  *
  * That one id is most of why the voice sounded broken. eSpeak emits `ᵻ` for

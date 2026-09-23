@@ -1,6 +1,7 @@
 import { rect, type Rect } from "../core/geometry";
 import type { TextRun } from "../core/types";
-import { isTextItem, type PdfPageProxy, type PdfTextItem } from "./pdfTypes";
+import { isTextItem, type PdfPageProxy } from "./pdfTypes";
+import { assembleWords } from "./words";
 
 /**
  * §4.1 — "Both backends emit `[TextRun]`. Everything downstream is
@@ -22,67 +23,12 @@ export function pageBoxOf(page: PdfPageProxy): Rect {
   return rect(Math.min(x0, x1), Math.min(y0, y1), Math.abs(x1 - x0), Math.abs(y1 - y0));
 }
 
-/**
- * pdf.js hands back a text item per show-text operator, which is a line, a
- * fragment, or a word depending on how the PDF was produced. §4.4 and §4.5
- * classify individual *words* — a footnote marker is one superscript glyph
- * beside a body-size word — so items have to be cut at their spaces.
- *
- * The cut is proportional to character count, which is exact for a monospaced
- * font and an approximation for everything else. It only ever moves a word box
- * horizontally within its own line, and the three things that read these boxes
- * are the column histogram (x-midpoints, ~10 pt bins), the marker test (which
- * reads `glyphHeight` and `baseline`, both taken from the item and therefore
- * exact), and the iPad-style page overlay (where a point or two of slack on a
- * highlight rectangle is invisible). A deviation, and a cheap one.
- */
-export function splitItemIntoRuns(item: PdfTextItem, pageIndex: number): TextRun[] {
-  const text = item.str;
-  if (text.trim().length === 0) return [];
-
-  const x = item.transform[4];
-  const baseline = item.transform[5];
-  const height = Math.abs(item.height) || Math.abs(item.transform[3]) || 1;
-  const width = item.width;
-  // Boxes are quoted from the baseline down by a nominal descender, so
-  // `maxY` lands near the cap height and vertical-overlap tests behave.
-  const descent = height * 0.2;
-
-  const runs: TextRun[] = [];
-  const perCharacter = text.length > 0 ? width / text.length : 0;
-  let cursor = 0;
-  for (const piece of text.split(/(\s+)/u)) {
-    if (piece.length === 0) continue;
-    if (/^\s+$/u.test(piece)) {
-      cursor += piece.length;
-      continue;
-    }
-    const left = x + cursor * perCharacter;
-    runs.push({
-      text: piece,
-      bbox: rect(left, baseline - descent, piece.length * perCharacter, height),
-      glyphHeight: height,
-      baseline,
-      pageIndex,
-      columnIndex: 0,
-      orderIndex: 0,
-    });
-    cursor += piece.length;
-  }
-  return runs;
-}
-
 export class PdfJsBackend implements TextRunBackend {
   readonly name = "pdf.js text layer";
 
   async runs(page: PdfPageProxy, pageIndex: number): Promise<TextRun[]> {
     const content = await page.getTextContent({ includeMarkedContent: false });
-    const out: TextRun[] = [];
-    for (const item of content.items) {
-      if (!isTextItem(item)) continue;
-      out.push(...splitItemIntoRuns(item, pageIndex));
-    }
-    return out;
+    return assembleWords(content.items.filter(isTextItem), pageIndex);
   }
 }
 
