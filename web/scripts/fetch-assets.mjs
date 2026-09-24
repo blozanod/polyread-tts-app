@@ -7,10 +7,9 @@
  * nothing but its own origin: the desktop builds bundle what lands here, and a
  * self-hosted copy serves it from the same directory as the page.
  *
- *   node scripts/fetch-assets.mjs                  # fp16, the default voices
- *   node scripts/fetch-assets.mjs --gpu-fallback   # + an fp32 copy for GPUs that refuse fp16
- *   node scripts/fetch-assets.mjs --dtype q8f16    # smaller, faster on CPU
- *   node scripts/fetch-assets.mjs --dtype fp32     # largest, runs on every GPU
+ *   node scripts/fetch-assets.mjs                  # fp16 for the CPU, fp32 for the GPU, default voices
+ *   node scripts/fetch-assets.mjs --no-gpu-model   # fp16 only, half the download
+ *   node scripts/fetch-assets.mjs --dtype q8f16    # a smaller CPU model
  *   node scripts/fetch-assets.mjs --voices all     # every voice, ~28 MB more
  *   node scripts/fetch-assets.mjs --voices-from-npm
  *
@@ -49,14 +48,18 @@ function parseArgs(argv) {
     force: false,
     list: false,
     repo: MODEL_REPO,
-    gpuFallback: false,
+    gpuModel: true,
+    gpuDtype: "fp32",
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--dtype") args.dtype = argv[++i];
     else if (arg === "--voices") args.voices = argv[++i];
     else if (arg === "--voices-from-npm") args.voicesFromNpm = true;
-    else if (arg === "--gpu-fallback") args.gpuFallback = true;
+    // Kept so the command in older instructions still works: this is the default now.
+    else if (arg === "--gpu-fallback") args.gpuModel = true;
+    else if (arg === "--no-gpu-model") args.gpuModel = false;
+    else if (arg === "--gpu-dtype") args.gpuDtype = argv[++i];
     else if (arg === "--repo") args.repo = argv[++i];
     else if (arg === "--force") args.force = true;
     else if (arg === "--list") args.list = true;
@@ -68,9 +71,9 @@ function parseArgs(argv) {
           "  --list                                 show what the repository publishes, and stop",
           "  --dtype <fp32|fp16|q8|q8f16|q4|q4f16|uint8|uint8f16|FILE>",
           "                                         model precision, or an exact filename (default fp16)",
-          "  --gpu-fallback                         also fetch an fp32 copy as kokoro-gpu.onnx, which",
-          "                                         the app loads on the GPU when the main model is",
-          "                                         refused — instead of dropping to the CPU",
+          "  --gpu-dtype <fp32|FILE>                the GPU's model, fetched as kokoro-gpu.onnx (default fp32,",
+          "                                         which is what kokoro-js recommends on WebGPU)",
+          "  --no-gpu-model                         skip it; the GPU then runs kokoro.onnx",
           "  --voices <default|all|a,b,c>           which voices (default: the B-and-better ones)",
           "  --voices-from-npm                      take voices from the kokoro-js package instead of the Hub",
           "  --repo <owner/name>                    a different model repository",
@@ -157,8 +160,8 @@ async function listAndExit(repo) {
   console.log(`\nVoices: ${voices.length} files, about 0.5 MB each`);
   console.log(`  ${voices.slice(0, 6).map((f) => f.slice(7, -4)).join(", ")}${voices.length > 6 ? ", …" : ""}`);
 
-  console.log("\nfp16 is the fastest thing a GPU can run and the one some drivers refuse;");
-  console.log("--gpu-fallback fetches an fp32 copy alongside it so those keep using the GPU.");
+  console.log("\nBy default two files are fetched: fp16 as kokoro.onnx, which is what the CPU runs");
+  console.log("fastest, and fp32 as kokoro-gpu.onnx, which is what the GPU should run.");
   console.log("\nThe same download serves the website and the desktop installers.");
   console.log("Pick one model file and run, for example:");
   console.log("  node scripts/fetch-assets.mjs --dtype fp16");
@@ -284,24 +287,24 @@ async function main() {
     );
   }
 
-  // The GPU-compatible spare. fp32 rather than a quantized file on purpose:
-  // int8 graphs fall back to the CPU node by node on the WebGPU provider, which
-  // would defeat the point of fetching it. This is the last rung of the ladder
-  // in `synthesis/kokoroEngine.ts` before synthesis moves to the CPU.
-  if (args.gpuFallback) {
-    const fallbackDtype = args.dtype === "fp32" ? undefined : "fp32";
-    if (!fallbackDtype) {
-      console.log("\nGPU fallback: not needed — fp32 already runs on every GPU.");
-    } else {
-      const fallbackFile = pickModelFile(files, fallbackDtype);
-      console.log(`\nGPU fallback (${fallbackDtype}):`);
-      await download(
-        `${HUB}/${args.repo}/resolve/main/${fallbackFile}`,
-        join(outDir, "kokoro-gpu.onnx"),
-        `kokoro-gpu.onnx (${fallbackFile})`,
-        args.force,
-      );
-    }
+  // The GPU's model: full precision, which is what kokoro-js recommends on
+  // WebGPU — at half precision the vocoder is audibly worse, and some drivers
+  // will not run it at all. Not a quantized file either: int8 graphs fall back
+  // to the CPU node by node on the WebGPU provider. `synthesis/kokoroEngine.ts`
+  // tries this first on every GPU, and the browser only downloads the file the
+  // machine will actually run.
+  if (args.gpuModel) {
+    const gpuDtype = args.gpuDtype;
+    const gpuFile = pickModelFile(files, gpuDtype);
+    console.log(`\nGPU model (${gpuDtype}):`);
+    await download(
+      `${HUB}/${args.repo}/resolve/main/${gpuFile}`,
+      join(outDir, "kokoro-gpu.onnx"),
+      `kokoro-gpu.onnx (${gpuFile})`,
+      args.force,
+    );
+  } else {
+    console.log("\nGPU model: skipped (--no-gpu-model); the GPU will run kokoro.onnx.");
   }
 
   console.log("\nTokenizer:");

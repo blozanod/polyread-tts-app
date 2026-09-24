@@ -1,13 +1,14 @@
 import { PolyReadError } from "../core/errors";
-import { median, type Rect } from "../core/geometry";
+import { maxX, median, minX, type Rect } from "../core/geometry";
 import { checkBlocks, violations } from "../core/spanInvariant";
 import { newID, type Block, type TextRun } from "../core/types";
 import {
+  analyzeColumn,
   isHeading,
+  silenceFigureText,
   isPublisherBoilerplate,
   materialize,
   mergeAcrossPages,
-  paragraphs,
   protoText,
   tokenizeParagraph,
   type ProtoBlock,
@@ -15,12 +16,12 @@ import {
 import { OcrBackend, PdfJsBackend, pageBoxOf, type TextRunBackend } from "./backends";
 import {
   footnoteBodyLineIndices,
-  groupIntoLines,
   FurnitureClassifier,
+  layoutPage,
   leadingLabel,
+  lineBBox,
   lineBaseline,
   lineGlyphHeight,
-  orderRuns,
   type Line,
 } from "./pageLayout";
 import type { PdfDocumentProxy } from "./pdfTypes";
@@ -118,8 +119,7 @@ export async function extractDocument(
       } catch {
         raw = [];
       }
-      const ordered = orderRuns(raw, box);
-      const lines = orderedLines(ordered);
+      const lines = layoutPage(raw, box);
       pageLines.push(lines);
       furniture.observe(lines, box, index);
       for (const line of lines) allGlyphHeights.push(lineGlyphHeight(line));
@@ -173,7 +173,11 @@ export async function extractDocument(
       // Main text, per column so a paragraph never straddles the gutter.
       for (const column of [...new Set(mainLines.map((l) => l.columnIndex))].sort((a, b) => a - b)) {
         const columnLines = mainLines.filter((l) => l.columnIndex === column);
-        for (const paragraph of paragraphs(columnLines)) {
+        const shape = analyzeColumn(columnLines);
+        const columnWidth =
+          Math.max(...columnLines.map((l) => maxX(lineBBox(l)))) - Math.min(...columnLines.map((l) => minX(lineBBox(l))));
+        for (let p = 0; p < shape.paragraphs.length; p++) {
+          const paragraph = shape.paragraphs[p];
           const { tokens, markers } = tokenizeParagraph(paragraph);
           if (tokens.length === 0 && markers.length === 0) continue;
 
@@ -185,6 +189,9 @@ export async function extractDocument(
             columnIndex: column,
             glyphHeight: median(paragraph.map(lineGlyphHeight)),
             lineCount: paragraph.length,
+            startsIndented: shape.startsIndented[p],
+            endsFull: shape.endsFull[p],
+            columnWidth,
           };
           if (isHeading(block, bodyGlyphHeight)) block.role = "heading";
           // A database's own front matter is furniture, whatever size it is set
@@ -263,6 +270,7 @@ export async function extractDocument(
     // §4.6 cross-page paragraph merge. Runs over main-stream blocks only —
     // footnote bodies were pulled out above and never straddle a page.
     const mergedInto = new Map<string, string>();
+    silenceFigureText(proto, bodyGlyphHeight);
     proto = mergeAcrossPages(proto, mergedInto);
     /** Follows a block id through however many merges absorbed it. */
     const survivingID = (id: string | undefined): string | undefined => {
@@ -348,13 +356,6 @@ export async function extractDocument(
   } finally {
     await ocr?.dispose();
   }
-}
-
-function orderedLines(runs: ReturnType<typeof orderRuns>): Line[] {
-  return groupIntoLines(runs).sort((a, b) => {
-    if (a.columnIndex !== b.columnIndex) return a.columnIndex - b.columnIndex;
-    return lineBaseline(b) - lineBaseline(a);
-  });
 }
 
 /** §9 — "title from the PDF's document title or filename". */

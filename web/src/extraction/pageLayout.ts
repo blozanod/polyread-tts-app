@@ -1,4 +1,4 @@
-import { maxX, maxY, median, midX, minX, minY, unionAll, type Rect } from "../core/geometry";
+import { maxX, maxY, median, minX, minY, unionAll, type Rect } from "../core/geometry";
 import type { BlockRole, TextRun } from "../core/types";
 
 /**
@@ -18,110 +18,301 @@ export const lineBaseline = (line: Line): number => median(line.runs.map((r) => 
 export const lineGlyphHeight = (line: Line): number => median(line.runs.map((r) => r.glyphHeight));
 export const lineText = (line: Line): string => line.runs.map((r) => r.text).join(" ");
 
-// MARK: - §4.3 Column detection
+// MARK: - §4.3 Lines and columns
 
 /**
- * "Per page, histogram run bbox x-midpoints in ~10 pt bins. Look for a
- * zero-density gap spanning >15% of page width, centred between 30% and 70% of
- * page width."
+ * A stretch of one line of type with no gutter-sized gap in it.
+ *
+ * Lines are built in two steps because a page does not say where its columns
+ * are. The old approach assumed it could find them first — a histogram of word
+ * midpoints, looking for an empty stretch 15% of the page wide — and then group
+ * each column's words into lines. No journal's gutter is 15% of the page; a
+ * quarter-inch gutter is 4%. So the second column was essentially never found,
+ * the two columns' lines were fused at the same height, and a two-column
+ * article was read straight across the page, a line from each column in turn.
+ *
+ * Segments invert that. Words are chained left to right into runs of one line
+ * that stop at any gap wider than an em — which a word space never is and a
+ * gutter always is — so the columns fall out as groups of segments rather than
+ * having to be found first.
  */
-export const BIN_WIDTH = 10;
-export const MINIMUM_GAP_FRACTION = 0.15;
-export const GAP_CENTRE_MIN = 0.3;
-export const GAP_CENTRE_MAX = 0.7;
+export interface Segment {
+  runs: TextRun[];
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  /** Baseline and glyph height of the segment's last full-size run. */
+  baseline: number;
+  height: number;
+}
 
-/** Returns the x of the column split, or undefined for a single column. */
-export function columnSplitX(runs: readonly TextRun[], pageBox: Rect): number | undefined {
-  if (runs.length < 12 || pageBox.width <= 0) return undefined;
+/** A gap wider than this, in ems, ends a segment: a gutter, never a word space. */
+export const SEGMENT_GAP = 1.0;
+/** Two runs whose baselines differ by less than this, in ems, are on one line. */
+export const LINE_TOLERANCE = 0.35;
 
-  const binCount = Math.max(1, Math.ceil(pageBox.width / BIN_WIDTH));
-  const histogram = new Int32Array(binCount);
-  for (const run of runs) {
-    const offset = midX(run.bbox) - minX(pageBox);
-    const bin = Math.floor(offset / BIN_WIDTH);
-    if (bin < 0 || bin >= binCount) continue;
-    histogram[bin] += 1;
-  }
-
-  // Longest zero-density stretch that is not the outer margin.
-  let best: { start: number; length: number } | undefined;
-  let runStart = -1;
-  const consider = (start: number, end: number): void => {
-    const length = end - start;
-    if (!best || length > best.length) best = { start, length };
-  };
-  for (let i = 0; i < binCount; i++) {
-    if (histogram[i] === 0) {
-      if (runStart < 0) runStart = i;
-    } else if (runStart >= 0) {
-      consider(runStart, i);
-      runStart = -1;
+/**
+ * Chains runs into segments, left to right.
+ *
+ * Each run is compared with the *last* run of each open segment rather than
+ * with where the line started, so a scan's skew — a baseline that drifts a
+ * point or three across the page — never breaks a line apart, and per-word
+ * baseline noise never shuffles one. A raised or lowered small run joins the
+ * line it sits on without moving that line's baseline: that is a footnote
+ * marker, and §4.5 finds it by exactly that shape.
+ */
+export function buildSegments(runs: readonly TextRun[]): Segment[] {
+  const sorted = [...runs].sort((a, b) => minX(a.bbox) - minX(b.bbox) || b.baseline - a.baseline);
+  const segments: Segment[] = [];
+  for (const run of sorted) {
+    let best: Segment | undefined;
+    let bestDistance = Infinity;
+    let bestIsScript = false;
+    for (const segment of segments) {
+      const last = segment.runs[segment.runs.length - 1];
+      const em = Math.max(run.glyphHeight, segment.height);
+      const gap = minX(run.bbox) - maxX(last.bbox);
+      if (gap > SEGMENT_GAP * em || gap < -0.5 * em) continue;
+      const dy = run.baseline - segment.baseline;
+      const smaller = run.glyphHeight < segment.height * MARKER_HEIGHT_RATIO;
+      const onLine = Math.abs(dy) <= LINE_TOLERANCE * Math.min(run.glyphHeight, segment.height);
+      const script = smaller && Math.abs(dy) > 0.1 * segment.height && Math.abs(dy) <= 0.75 * segment.height;
+      if (!onLine && !script) continue;
+      const distance = Math.abs(dy) + (script ? segment.height : 0) + Math.max(0, gap) * 0.01;
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = segment;
+        bestIsScript = !onLine;
+      }
+    }
+    if (best) {
+      best.runs.push(run);
+      best.minX = Math.min(best.minX, minX(run.bbox));
+      best.maxX = Math.max(best.maxX, maxX(run.bbox));
+      best.minY = Math.min(best.minY, minY(run.bbox));
+      best.maxY = Math.max(best.maxY, maxY(run.bbox));
+      if (!bestIsScript) {
+        best.baseline = run.baseline;
+        best.height = run.glyphHeight;
+      }
+    } else {
+      segments.push({
+        runs: [run],
+        minX: minX(run.bbox),
+        maxX: maxX(run.bbox),
+        minY: minY(run.bbox),
+        maxY: maxY(run.bbox),
+        baseline: run.baseline,
+        height: run.glyphHeight,
+      });
     }
   }
-  if (runStart >= 0) consider(runStart, binCount);
+  return segments;
+}
 
-  if (!best) return undefined;
-  const gapWidth = best.length * BIN_WIDTH;
-  if (gapWidth <= pageBox.width * MINIMUM_GAP_FRACTION) return undefined;
-
-  const centre = (best.start + best.length / 2) * BIN_WIDTH;
-  const centreFraction = centre / pageBox.width;
-  if (centreFraction < GAP_CENTRE_MIN || centreFraction > GAP_CENTRE_MAX) return undefined;
-
-  return minX(pageBox) + centre;
+export interface Gutter {
+  x: number;
+  width: number;
 }
 
 /**
- * Runs whose baselines agree within half a glyph height are one line.
+ * The gutter between two columns of segments, if there is one.
  *
- * The grouping pass walks the column in baseline order, so the runs land in a
- * line in *baseline* order — which is only reading order when every run on the
- * line shares one baseline exactly. That holds for a born-digital page, where
- * pdf.js emits a whole line as one text item and `splitItemIntoRuns` copies the
- * item's single `transform[5]` onto every word it cuts out. It does not hold
- * for the per-word text layer a scan carries: OCR gives each word its own
- * baseline, and they disagree by a fraction of a point.
- *
- * Sub-point disagreement is invisible on the page and changes nothing about
- * which line a word belongs to — but sorting on it puts the words of a line in
- * an order that has nothing to do with where they sit, and a paragraph comes
- * out as its own words shuffled. So reading order is restored explicitly here,
- * once, rather than being left to depend on how the baselines happened to tie:
- * a `Line`'s runs are left-to-right, which is what `lineText` and
- * `tokenizeParagraph` have always assumed they were reading.
+ * A gutter is a vertical strip in the middle half of the text area that almost
+ * nothing crosses — only the title, the abstract and the odd full-width figure
+ * caption, which is why "almost" rather than "nothing" — with column-shaped text
+ * on both sides of it: text standing side by side, in segments wide enough to be
+ * lines of a column rather than cells of a table. A table read row by row is
+ * better than one read column by column, and the width test is what tells them
+ * apart.
  */
-export function groupIntoLines(runs: readonly TextRun[]): Line[] {
-  if (runs.length === 0) return [];
-  const byColumn = new Map<number, TextRun[]>();
-  for (const run of runs) {
-    const list = byColumn.get(run.columnIndex);
-    if (list) list.push(run);
-    else byColumn.set(run.columnIndex, [run]);
+export function findGutter(segments: readonly Segment[]): Gutter | undefined {
+  if (segments.length < 6) return undefined;
+  const left = Math.min(...segments.map((s) => s.minX));
+  const right = Math.max(...segments.map((s) => s.maxX));
+  const extent = right - left;
+  if (extent <= 0) return undefined;
+  const em = median(segments.map((s) => s.height));
+
+  const from = Math.floor(left + extent * 0.25);
+  const to = Math.ceil(left + extent * 0.75);
+  const crossings = new Int32Array(to - from + 1);
+  // A folio, a marker or a lone word is not a line of either column, and a
+  // page number set in the gutter would otherwise narrow it to nothing.
+  const lines = segments.filter((s) => s.maxX - s.minX >= em * 3);
+  for (const segment of lines) {
+    const a = Math.max(from, Math.ceil(segment.minX));
+    const b = Math.min(to, Math.floor(segment.maxX));
+    for (let x = a; x <= b; x++) crossings[x - from] += 1;
+  }
+  let fewest = Infinity;
+  for (const count of crossings) fewest = Math.min(fewest, count);
+  if (fewest > lines.length * 0.35) return undefined;
+
+  // The widest stretch at that minimum.
+  let bestStart = -1;
+  let bestLength = 0;
+  for (let i = 0; i < crossings.length; ) {
+    if (crossings[i] !== fewest) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < crossings.length && crossings[j] === fewest) j++;
+    if (j - i > bestLength) {
+      bestLength = j - i;
+      bestStart = i;
+    }
+    i = j;
+  }
+  if (bestStart < 0 || bestLength < Math.max(3, em * 0.4)) return undefined;
+  const x = from + bestStart + bestLength / 2;
+
+  const leftSide = lines.filter((s) => s.maxX <= x);
+  const rightSide = lines.filter((s) => s.minX >= x);
+  if (leftSide.length < 3 || rightSide.length < 3) return undefined;
+  // Lines of a column, not cells of a table.
+  if (median(leftSide.map((s) => s.maxX - s.minX)) < extent * 0.22) return undefined;
+  if (median(rightSide.map((s) => s.maxX - s.minX)) < extent * 0.22) return undefined;
+  // Side by side, not one above the other.
+  const top = (list: Segment[]) => Math.max(...list.map((s) => s.maxY));
+  const bottom = (list: Segment[]) => Math.min(...list.map((s) => s.minY));
+  const overlap = Math.min(top(leftSide), top(rightSide)) - Math.max(bottom(leftSide), bottom(rightSide));
+  const shorter = Math.min(top(leftSide) - bottom(leftSide), top(rightSide) - bottom(rightSide));
+  if (overlap < shorter * 0.5) return undefined;
+  return { x, width: bestLength };
+}
+
+/**
+ * Segments in reading order, grouped into the regions they are read in.
+ *
+ * Where a gutter is found, whatever crosses it (a title, an abstract, a
+ * full-width caption) cuts the page into bands, and each band is read left
+ * column then right column before the next spanning block. That is how a
+ * journal page is read, and it keeps a caption in the middle of the page from
+ * being read as part of the column beside it. Each column is searched for a
+ * gutter of its own, so three columns work the same way.
+ */
+export function readingRegions(segments: readonly Segment[], depth = 0): Segment[][] {
+  if (segments.length === 0) return [];
+  const gutter = depth < 3 ? findGutter(segments) : undefined;
+  if (!gutter) return [[...segments]];
+
+  const slack = Math.max(4, gutter.width * 0.25);
+  const left: Segment[] = [];
+  const right: Segment[] = [];
+  const spanning: Segment[] = [];
+  for (const segment of segments) {
+    const intoLeft = gutter.x - segment.minX;
+    const intoRight = segment.maxX - gutter.x;
+    if (intoLeft > slack && intoRight > slack) spanning.push(segment);
+    else if (intoRight <= intoLeft) left.push(segment);
+    else right.push(segment);
   }
 
-  const lines: Line[] = [];
-  for (const [column, columnRuns] of byColumn) {
-    const sorted = [...columnRuns].sort((a, b) => b.baseline - a.baseline);
-    let current: TextRun[] = [];
-    let currentBaseline = 0;
-    for (const run of sorted) {
-      const tolerance = Math.max(2, run.glyphHeight * 0.5);
-      if (current.length === 0 || Math.abs(run.baseline - currentBaseline) <= tolerance) {
-        if (current.length === 0) currentBaseline = run.baseline;
-        current.push(run);
-      } else {
-        lines.push({ runs: current, columnIndex: column, pageIndex: current[0].pageIndex });
-        current = [run];
-        currentBaseline = run.baseline;
+  // The last line of a full-width paragraph is usually short, and sits wholly
+  // on one side of the gutter: the end of an abstract would otherwise be read
+  // as the first line of the column under it. A line directly beneath a
+  // spanning one, on its margin and in its size, is part of it.
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const above of [...spanning]) {
+      for (const side of [left, right]) {
+        const index = side.findIndex(
+          (s) =>
+            Math.abs(s.minX - above.minX) <= 2 &&
+            Math.abs(s.height - above.height) <= above.height * 0.1 &&
+            above.baseline - s.baseline > 0 &&
+            above.baseline - s.baseline <= above.height * 1.6,
+        );
+        if (index >= 0) {
+          spanning.push(side[index]);
+          side.splice(index, 1);
+          grew = true;
+        }
       }
     }
-    if (current.length > 0) {
-      lines.push({ runs: current, columnIndex: column, pageIndex: current[0].pageIndex });
+  }
+
+  const out: Segment[][] = [];
+  const centre = (s: Segment) => (s.minY + s.maxY) / 2;
+  const emit = (upper: number, lower: number) => {
+    const inBand = (s: Segment) => centre(s) < upper && centre(s) >= lower;
+    out.push(...readingRegions(left.filter(inBand), depth + 1));
+    out.push(...readingRegions(right.filter(inBand), depth + 1));
+  };
+  // Spanning segments in page order, runs of them grouped into one region.
+  const blocks = [...spanning].sort((a, b) => b.maxY - a.maxY);
+  let upper = Infinity;
+  let i = 0;
+  while (i < blocks.length) {
+    let j = i + 1;
+    let floor = blocks[i].minY;
+    // Consecutive spanning lines with no column text between them are one block.
+    while (
+      j < blocks.length &&
+      !left.concat(right).some((s) => centre(s) < floor && centre(s) >= blocks[j].maxY)
+    ) {
+      floor = Math.min(floor, blocks[j].minY);
+      j++;
+    }
+    emit(upper, centre(blocks[i]));
+    out.push(blocks.slice(i, j));
+    upper = centre(blocks[j - 1]);
+    i = j;
+  }
+  emit(upper, -Infinity);
+  return out.filter((region) => region.length > 0);
+}
+
+/** One region's segments as lines of type, top to bottom, each left to right. */
+function linesOfRegion(segments: readonly Segment[], columnIndex: number): Line[] {
+  const sorted = [...segments].sort((a, b) => b.baseline - a.baseline || a.minX - b.minX);
+  const lines: Line[] = [];
+  let current: Segment[] = [];
+  const flush = () => {
+    if (current.length === 0) return;
+    const runs = current.flatMap((s) => s.runs);
+    lines.push({ runs, columnIndex, pageIndex: runs[0].pageIndex });
+    current = [];
+  };
+  for (const segment of sorted) {
+    const head = current[0];
+    const tolerance = head ? LINE_TOLERANCE * Math.min(head.height, segment.height) + 0.5 : 0;
+    const overlaps = current.some((s) => s.minX < segment.maxX && segment.minX < s.maxX);
+    if (head && Math.abs(segment.baseline - head.baseline) <= tolerance && !overlaps) current.push(segment);
+    else {
+      flush();
+      current.push(segment);
     }
   }
+  flush();
   // After `attachSuperscripts`, so a marker folded into its host line takes its
   // place beside the word it annotates rather than at the end of the line.
-  return inReadingOrder(attachSuperscripts(lines));
+  return inReadingOrder(attachSuperscripts(lines)).sort((a, b) => lineBaseline(b) - lineBaseline(a));
+}
+
+/**
+ * §4.3 for one page: every line of type, in reading order, with `columnIndex`
+ * numbering the regions in the order they are read.
+ */
+export function layoutPage(runs: readonly TextRun[], _pageBox?: Rect): Line[] {
+  const regions = readingRegions(buildSegments(runs));
+  return regions.flatMap((region, index) => linesOfRegion(region, index));
+}
+
+/**
+ * Lines of a single column: runs whose baselines agree are one line, read left
+ * to right. Kept for callers that already know there is one column.
+ */
+export function groupIntoLines(runs: readonly TextRun[]): Line[] {
+  return linesOfRegion(buildSegments(runs), 0);
+}
+
+/** Where the gutter is, if the page has one. */
+export function columnSplitX(runs: readonly TextRun[], _pageBox?: Rect): number | undefined {
+  return findGutter(buildSegments(runs))?.x;
 }
 
 /** Left-to-right within each line. The invariant every later pass relies on. */
@@ -134,23 +325,13 @@ function inReadingOrder(lines: Line[]): Line[] {
  * Folds a line that is nothing but raised markers back into the line it
  * annotates.
  *
- * **A fix, not a port.** The baseline tolerance above is half the *run's* own
- * glyph height, and a footnote marker is set at roughly 0.58x the body size and
- * raised by roughly 0.33x an em. For 11 pt body text that is a 6.4 pt glyph
- * lifted 3.6 pt, against a tolerance of 3.2 — so the marker misses its line by a
- * fraction of a point and becomes a line of its own.
- *
- * That is silently fatal to §4.5. `isMarker` asks whether a run is small and
- * raised *relative to its line*, and a marker alone on a line is neither: it is
- * exactly as tall as its line and sits exactly on its baseline. It reads as
- * body text, so the footnote number is spoken aloud in the middle of the
- * sentence, and §8.5 loses the tap target it was promised.
- *
- * Widening the general tolerance would work but risks welding genuinely
- * adjacent lines together — single-spaced leading is only about 1.2x the body
- * size. This is narrower: a line has to consist *entirely* of marker-shaped
- * runs, and it joins the nearest line below it that is tall enough for it to be
- * a superscript of.
+ * `buildSegments` keeps a marker on its line when the marker sits right after
+ * the word it annotates. One set apart by a space wider than an em, or one that
+ * starts a segment of its own, still arrives here alone; and a marker alone on
+ * a line is exactly as tall as its line and sits exactly on its baseline, so
+ * `isMarker` would read it as body text and the footnote number would be spoken
+ * mid-sentence. So a line consisting *entirely* of marker-shaped runs joins the
+ * nearest line below it that is tall enough for it to be a superscript of.
  */
 function attachSuperscripts(lines: Line[]): Line[] {
   if (lines.length < 2) return lines;
@@ -193,42 +374,13 @@ function attachSuperscripts(lines: Line[]): Line[] {
   return lines.filter((_, i) => !absorbed.has(i));
 }
 
-/**
- * Assigns `columnIndex` and sorts into reading order: column-major for two
- * columns, plain descending-y for one.
- */
+/** Assigns `columnIndex` and `orderIndex` in reading order. */
 export function orderRuns(runs: readonly TextRun[], pageBox: Rect): TextRun[] {
-  const out = runs.map((r) => ({ ...r }));
-  const split = columnSplitX(out, pageBox);
-
-  for (const run of out) {
-    run.columnIndex = split !== undefined && midX(run.bbox) >= split ? 1 : 0;
-  }
-
-  // Group into lines before sorting: sorting individual runs by y alone
-  // shuffles words whose baselines differ by a fraction of a point.
-  //
-  // The comparator is a plain total order — column, then down the page, then
-  // across it. It used to compare baselines through a tolerance and fall back
-  // to x when they were close, which is not transitive: with lines a, b, c
-  // where a and b are close, b and c are close, but a and c are not, the
-  // answer depends on which pairs the sort happens to compare, and V8 changes
-  // that at 22 elements. `groupIntoLines` has already merged everything within
-  // a line's tolerance into one `Line`, so two lines left in the same column
-  // genuinely differ in baseline and the tolerance bought nothing.
-  const sorted = groupIntoLines(out).sort((a, b) => {
-    if (a.columnIndex !== b.columnIndex) return a.columnIndex - b.columnIndex;
-    // Origin bottom-left: higher y is earlier.
-    const byBaseline = lineBaseline(b) - lineBaseline(a);
-    if (byBaseline !== 0) return byBaseline;
-    return minX(lineBBox(a)) - minX(lineBBox(b));
-  });
-
   const result: TextRun[] = [];
   let orderIndex = 0;
-  for (const line of sorted) {
-    // `groupIntoLines` already put these left to right.
+  for (const line of layoutPage(runs.map((r) => ({ ...r })), pageBox)) {
     for (const run of line.runs) {
+      run.columnIndex = line.columnIndex;
       run.orderIndex = orderIndex++;
       result.push(run);
     }

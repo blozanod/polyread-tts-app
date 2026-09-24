@@ -432,20 +432,22 @@ describe("the compute ladder", () => {
     voiceID: "af_heart",
   };
 
-  it("exhausts every GPU before it reaches the CPU", async () => {
+  it("exhausts every GPU before it reaches the CPU, full precision first", async () => {
     const { planAttempts } = await import("../src/synthesis/kokoroEngine");
     const plan = planAttempts(
-      { ...base, gpuFallbackModelUrl: "models/kokoro-gpu.onnx" },
+      { ...base, gpuModelUrl: "models/kokoro-gpu.onnx" },
       [candidate("nvidia RTX 3050", "discrete"), candidate("intel Iris Xe", "integrated")],
     );
 
-    expect(plan.map((a) => a.provider)).toEqual(["webgpu", "webgpu", "webgpu", "webgpu", "wasm"]);
-    // Both GPUs, then the best one unfused, then the model file a GPU accepts.
+    expect(plan.map((a) => a.provider)).toEqual(["webgpu", "webgpu", "webgpu", "webgpu", "webgpu", "webgpu", "wasm"]);
+    // Each GPU with the full-precision model, then the half-precision one;
+    // then the best GPU unfused; then the CPU, on the half-precision model.
+    expect(plan[0]).toMatchObject({ model: "gpu", optimization: "all" });
     expect(plan[0].label).toContain("RTX 3050");
-    expect(plan[1].label).toContain("Iris Xe");
-    expect(plan[2]).toMatchObject({ optimization: "disabled", model: "primary" });
-    expect(plan[3]).toMatchObject({ optimization: "all", model: "gpuFallback" });
-    expect(plan[4].label).toBe("CPU");
+    expect(plan[1]).toMatchObject({ model: "primary", optimization: "all" });
+    expect(plan[2].label).toContain("Iris Xe");
+    expect(plan[4]).toMatchObject({ optimization: "disabled", model: "gpu" });
+    expect(plan[6]).toMatchObject({ label: "CPU", model: "primary" });
   });
 
   it("drops the CPU rung entirely when Settings says GPU only", async () => {
@@ -461,10 +463,10 @@ describe("the compute ladder", () => {
     expect(plan[0].provider).toBe("wasm");
   });
 
-  it("has no GPU-model rung when no GPU-compatible model was fetched", async () => {
+  it("has no full-precision rung when no such model is configured", async () => {
     const { planAttempts } = await import("../src/synthesis/kokoroEngine");
     const plan = planAttempts(base, [candidate("nvidia RTX 3050", "discrete")]);
-    expect(plan.some((a) => a.model === "gpuFallback")).toBe(false);
+    expect(plan.some((a) => a.model === "gpu")).toBe(false);
   });
 
   it("still offers the CPU when the machine has no GPU at all", async () => {
@@ -484,7 +486,7 @@ describe("the compute ladder", () => {
     // be in the message rather than left as an inference.
     expect(explained).toContain("Iris Xe");
     expect(explained).toContain("16-bit");
-    expect(explained).toContain("--gpu-fallback");
+    expect(explained).toContain("kokoro-gpu.onnx");
   });
 
   it("says nothing about f16 when the GPU has it and refused anyway", async () => {

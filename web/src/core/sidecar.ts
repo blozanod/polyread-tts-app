@@ -10,7 +10,7 @@ import type { Block, ChunkTiming, PhonemizedChunk, WordTiming } from "./types";
  * laid-out reflow text (§10) and the per-footnote timelines Phase A already
  * paid for (§4.5, §8.5).
  */
-export const SIDECAR_VERSION = 5;
+export const SIDECAR_VERSION = 6;
 
 export interface DocumentSidecar {
   /**

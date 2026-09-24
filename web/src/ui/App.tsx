@@ -306,8 +306,8 @@ function DeviceNotice({
 }): ReactElement | null {
   const notice = state.deviceNotice;
   if (!notice || state.model.kind === "failed") return null;
-  // The one remaining remedy, and it is a download rather than a setting: an
-  // fp32 copy of the model, which every GPU with working WebGPU can run.
+  // The one remaining remedy, and it is a download rather than a setting: the
+  // full-precision model, which every GPU with working WebGPU can run.
   const modelWouldHelp = /16-bit shader|refused the model/.test(notice);
   return (
     <div className="notice">
@@ -315,11 +315,11 @@ function DeviceNotice({
       <p className="notice-body">{notice}</p>
       {modelWouldHelp && (
         <>
-          <pre className="notice-code">npm run assets -- --gpu-fallback</pre>
+          <pre className="notice-code">npm run assets</pre>
           <p className="notice-body">
-            That fetches an fp32 copy of the voice (310 MB) alongside the one you have and leaves it
-            where PolyRead looks. It is slower than fp16 on a GPU and several times faster than
-            anything on a CPU, and it is only loaded if the GPU refuses the first file.
+            That fetches the full-precision voice model (310 MB) as kokoro-gpu.onnx and leaves it
+            where PolyRead looks. It is what the GPU tries first, it sounds better on a GPU than the
+            half-precision one, and it is several times faster than anything on a CPU.
           </p>
         </>
       )}

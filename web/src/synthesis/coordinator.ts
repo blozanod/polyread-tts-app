@@ -373,11 +373,16 @@ export class SynthesisCoordinator {
 
     for (let index = 0; index < layout.entries.length; index++) {
       if (this.cancelled) return;
-      // Keep §7.2's exact pass a few chunks in front of the audio, so a chunk's
-      // word timings firm up before anyone can reach it.
-      await this.refineUpTo(index + EXACT_TIMING_LOOKAHEAD, emit);
+      // The exact pass for this chunk only, before it renders. The lookahead
+      // below keeps it a few chunks in front of the audio — but running all of
+      // that ahead of the *first* render put eight duration passes between
+      // pressing play and hearing anything.
+      await this.refineUpTo(index + 1, emit);
       if (this.cancelled) return;
-      if (this.progress.renderedChunks.has(index)) continue;
+      if (this.progress.renderedChunks.has(index)) {
+        await this.refineUpTo(index + EXACT_TIMING_LOOKAHEAD, emit);
+        continue;
+      }
 
       try {
         await this.renderChunk(index, emit);
@@ -395,6 +400,10 @@ export class SynthesisCoordinator {
         }
         continue;
       }
+      if (this.cancelled) return;
+      // Keep §7.2's exact pass a few chunks in front of the audio, so a chunk's
+      // word timings firm up before anyone can reach it.
+      await this.refineUpTo(index + EXACT_TIMING_LOOKAHEAD, emit);
       if (this.cancelled) return;
 
       if (!primed) {
